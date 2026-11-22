@@ -22,37 +22,50 @@ Requires a userscript manager such as Tampermonkey or Violentmonkey.
 
 ## Key Features
 
-### Two-Stage Server Clock Calibration
+### Two-Stage Server Clock Calibration (with T-60s Timer Recalculation)
 
 Designed to reduce clock drift between your local machine and the provider's restock clock:
 
 1. **Initial calibration on start**: Immediately takes 3 consecutive `HEAD /` samples to correct the initial countdown.
-2. **Pre-drop refinement**: 60 seconds before the target time, takes 5 consecutive samples for a finer offset estimate.
+2. **Pre-drop refinement & timer recalculation**: 60 seconds before the target time, takes 5 consecutive samples and **immediately recalculates and reschedules the 50 ms sprint timer using the updated `serverTimeDelta`**, eliminating trigger drift when local-to-server clock offset changes significantly.
 3. **RTT midpoint estimation**: Each sample records send time, receive time, and the server's HTTP `Date` header, estimating the clock offset from the round-trip midpoint.
 4. **Trimmed mean**: Samples are sorted by RTT, the fastest and slowest outliers are discarded, and the remaining samples are averaged to suppress jitter.
 5. **High-frequency final countdown**: In the last 5 seconds, the countdown check interval tightens to 50 ms with a sprint highlight mode to minimize timer start latency.
 
 The top telemetry bar and countdown board display live task status, calibrated clock offset, and average RTT in real time. Note that HTTP `Date` headers typically have 1-second granularity and may be altered by proxies or CDNs, so this mechanism reduces timing error rather than guaranteeing millisecond-exact precision.
 
+### Per-Host Configuration, Quick Time Presets & Checkout Extensions
+
+- **Per-host storage (`location.host`)**: Target PIDs, start/stop timestamps, payment method, retry interval, promo code, mute preference, dragged panel coordinates, and collapse state are stored independently per host so monitoring multiple providers simultaneously never overwrites settings.
+- **Automatic legacy migration**: Upgrading from V4.2 or earlier seamlessly migrates legacy global GM keys into the per-host store on first read.
+- **Quick time preset capsules**: One-click **Next Hour**, **+1m**, **+5m**, and **Stop=+3m** pills eliminate tedious second-level datetime picking.
+- **Promo code & custom payment gateway**: Optional promo code field (submitted as `promo` during checkout) plus a **Custom Gateway...** option to specify any custom billing gateway code beyond Alipay, WeChat Pay, and PayPal.
+
+### Multi-Channel Alerts on Order Lock & Abnormal Stop
+
+- **Desktop notifications**: Uses `GM_notification` (with click-to-focus) and gracefully falls back to the standard Web `Notification` API.
+- **Zero-asset Web Audio synthesis**: Generates distinct synthesized chimes via `AudioContext` for order lock success vs. abnormal/timeout stop, complete with a persisted mute toggle in the panel header and user-gesture audio unlock on Start to bypass browser autoplay blocks.
+- **Tab title flashing & session-expiry detection**: Flashes `document.title` (automatically restored on focus) upon order lock, timeout stop, or detected login-page redirect so you never miss the invoice payment window while working in another tab.
+
 ### Shadow DOM Floating Panel & Security Hardening
 
 - **Shadow DOM style isolation**: Encapsulates all panel markup and styling inside an open Shadow Root so host page CSS never breaks the panel and the panel never leaks styles into the site.
-- **Drag positioning & collapsible capsule**: Drag the panel freely within viewport bounds from the header bar, or click **收起 / 展开** (Collapse / Expand) to fold it into a compact status pill.
+- **Drag positioning & collapsible capsule**: Drag the panel freely within viewport bounds from the header bar, or click **收起 / 展开** (Collapse / Expand) to fold it into a compact status pill; position and collapsed state persist per host.
 - **Live telemetry bar & countdown board**: Three-column metric strip showing live status dot, clock offset, and average RTT, paired with a monospace (`tabular-nums`) 0.1-second countdown board that enters sprint highlight during the final 5 seconds.
 - **Concise copy, inline validation & leveled logs**: Replaces blocking `alert` dialogs with an inline alert banner and automatic field focus; terminal-style logs are color-coded by severity, display the active hostname, and support one-click clearing.
 - **Timer cleanup & security fixes**: Centralizes cleanup of all active timers on stop, timeout, or restart; renders values and log entries via safe DOM properties / `textContent` to prevent XSS; and generates a 14-character fallback password with `crypto.getRandomValues` whenever a form requires a blank `password` field.
 
 ### Additional Capabilities
 
-- Polls multiple PIDs sequentially in a loop.
+- Polls multiple deduplicated PIDs sequentially in a loop.
 - Reuses current browser cookies automatically — no manual credential copying.
-- Dynamically parses product configuration forms (`input` and `select` fields) without hard-coding plan-specific fields.
-- Supports Alipay (`AliPayH5`), WeChat Pay (`wechatpay`), and PayPal (`paypal`) payment options.
+- Dynamically parses product configuration forms (`input`, `select`, and `textarea` fields) without hard-coding plan-specific fields.
+- Supports Alipay (`AliPayH5`), WeChat Pay (`wechatpay`), PayPal (`paypal`), and custom payment gateway codes.
 - Configurable auto-start time (to the second) and optional auto-stop time.
 - Three retry interval presets: `500ms` (Safe), `100ms` (Fast), and `10ms` (Extreme).
 - Screen Wake Lock support to prevent the device from sleeping while waiting, with automatic re-acquisition when returning to the tab.
 - Persists up to the latest 100 log entries across same-tab page navigations (`sessionStorage`).
-- Automatically redirects to the generated invoice/payment page upon verified checkout.
+- Verifies invoice URLs, fires multi-channel alerts, and automatically redirects to the generated invoice/payment page.
 
 ## Enabling on a Provider Site
 
@@ -157,9 +170,25 @@ Read configuration
 - Automated checkout can create real orders, duplicate orders, or payment obligations — always set a stop time and review resulting invoices promptly.
 - Success still depends on inventory, network latency, server load, and provider policies.
 
+## Development & Testing
+
+Core pure logic (time parsing & presets, per-host storage & legacy key migration, RTT calibration & T-60s timer recalculation, form extraction & checkout payload) can be verified locally with Node's zero-dependency built-in test runner:
+
+```bash
+node --check vps-drop-sync.user.js && node --test
+```
+
 ## Release Notes
 
-Current version: **V4.2.0**
+Current version: **V4.3.0**
+
+### V4.3.0
+
+- **Per-host storage & seamless migration**: Isolated PID, schedule timestamps, payment method, retry interval, promo code, mute state, panel coordinates, and collapse state by `location.host`, with automatic one-time migration from legacy global GM keys.
+- **Quick time presets & checkout extensions**: Added **Next Hour**, **+1m**, **+5m**, and **Stop=+3m** preset pills, an optional promo code field (`promo`), and a custom payment gateway input.
+- **Fixed T-60s sprint timer recalculation**: Immediately clears and reschedules the 50 ms precision sprint timer using the updated `serverTimeDelta` after T-60s secondary calibration completes.
+- **Multi-channel alerts on lock & abnormal stop**: Added `@grant GM_notification` (with Web Notification fallback), zero-asset `AudioContext` synthesized chimes (with mute toggle and gesture unlock on Start), `document.title` flashing, and login-redirect session-expiry detection.
+- **Automated tests & CI**: Added zero-dependency Node unit tests (`tests/`) and a GitHub Actions CI workflow.
 
 ### V4.2.0
 
