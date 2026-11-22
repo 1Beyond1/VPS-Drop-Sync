@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         VPS Drop Sync
 // @namespace    https://github.com/1Beyond1/VPS-Drop-Sync
-// @version      4.2.0
-// @description  通用 VPS 放货精准对时与自动抢购助手：二段式服务器校时、多 PID 轮询、动态表单解析与自动结账。
+// @version      4.3.0
+// @description  通用 VPS 放货精准对时与自动抢购助手：按域名隔离配置、二段式服务器校时、快捷时间预设、多通道强提醒与自动结账。
 // @author       1Beyond1
 // @license      MIT
 // @homepageURL  https://github.com/1Beyond1/VPS-Drop-Sync
@@ -12,6 +12,7 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_notification
 // @run-at       document-idle
 // @noframes
 // @updateURL    https://raw.githubusercontent.com/1Beyond1/VPS-Drop-Sync/main/vps-drop-sync.user.js
@@ -21,54 +22,402 @@
 (function () {
     'use strict';
 
-    const VERSION = '4.2.0';
+    const VERSION = '4.3.0';
     const ENABLED_HOSTS_KEY = 'vpsDropSyncEnabledHosts';
+    const HOST_CONFIG_PREFIX = 'vpsDropSyncHostConfig::';
     const LOG_STORAGE_KEY = 'vps_drop_sync_logs';
     const MAX_LOGS = 100;
+    const PRE_SYNC_LEAD_MS = 60000;
+    const SPRINT_LEAD_MS = 5200;
+    const PRESET_PAYMENT_METHODS = ['AliPayH5', 'wechatpay', 'paypal'];
+    const CUSTOM_PAYMENT_OPTION = '__custom__';
+    const VALID_SPEEDS = [500, 100, 10];
+    const LEGACY_KEYS = ['targetPid', 'startTime', 'stopTime', 'paymentMethod', 'speedMs'];
+    const MISSING_SENTINEL = Symbol('missing');
 
     // --------------------------------------------
-    // 时间格式与存储工具
+    // 核心纯逻辑（同时导出给 Node 单元测试复用）
     // --------------------------------------------
+    const pad2 = (n) => String(n).padStart(2, '0');
+
+    const formatLocalDateTime = (ms) => {
+        const d = new Date(ms);
+        if (Number.isNaN(d.getTime())) return '';
+        return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+    };
+
+    const parseLocalDateTime = (timeStr) => {
+        if (typeof timeStr !== 'string') return NaN;
+        const trimmed = timeStr.trim();
+        if (!trimmed) return NaN;
+        const match = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(trimmed);
+        if (!match) return NaN;
+        const year = Number(match[1]);
+        const month = Number(match[2]);
+        const day = Number(match[3]);
+        const hour = Number(match[4]);
+        const minute = Number(match[5]);
+        const second = match[6] !== undefined ? Number(match[6]) : 0;
+        if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) {
+            return NaN;
+        }
+        const date = new Date(year, month - 1, day, hour, minute, second, 0);
+        if (
+            date.getFullYear() !== year ||
+            date.getMonth() !== month - 1 ||
+            date.getDate() !== day ||
+            date.getHours() !== hour ||
+            date.getMinutes() !== minute ||
+            date.getSeconds() !== second
+        ) {
+            return NaN;
+        }
+        return date.getTime();
+    };
+
     const toDateTimeLocal = (timeStr) => {
         if (!timeStr) return '';
-        const normalized = timeStr.replace(' ', 'T');
+        const normalized = String(timeStr).trim().replace(' ', 'T');
         return normalized.length >= 19 ? normalized.slice(0, 19) : normalized.slice(0, 16);
     };
 
     const fromDateTimeLocal = (dtStr) => {
         if (!dtStr) return '';
-        const base = dtStr.replace('T', ' ');
-        return base.length >= 19 ? base : `${base}:00`;
+        const base = String(dtStr).trim().replace('T', ' ');
+        return base.length >= 19 ? base.slice(0, 19) : `${base}:00`;
     };
 
     const formatCountdown = (remainMs) => {
-        const clamped = Math.max(0, remainMs);
+        const clamped = Math.max(0, Number.isFinite(remainMs) ? remainMs : 0);
         const totalSec = Math.floor(clamped / 1000);
         const hours = Math.floor(totalSec / 3600);
         const mins = Math.floor((totalSec % 3600) / 60);
         const secs = totalSec % 60;
         const tenths = Math.floor((clamped % 1000) / 100);
-        const pad = (n) => String(n).padStart(2, '0');
-        return `${pad(hours)}:${pad(mins)}:${pad(secs)}.${tenths}`;
+        return `${pad2(hours)}:${pad2(mins)}:${pad2(secs)}.${tenths}`;
     };
 
-    const storageRead = (key, defaultVal) => {
-        try {
-            if (typeof GM_getValue === 'function') return GM_getValue(key, defaultVal);
-            const v = localStorage.getItem(`tm_${key}`);
-            return v !== null ? v : defaultVal;
-        } catch {
-            return defaultVal;
+    const computeTimePreset = (preset, { nowMs = Date.now(), startTimeStr = '' } = {}) => {
+        const baseMs = Math.floor(nowMs / 1000) * 1000;
+        if (preset === 'next-hour') {
+            const d = new Date(baseMs);
+            d.setMinutes(0, 0, 0);
+            d.setHours(d.getHours() + 1);
+            return { field: 'startTime', value: formatLocalDateTime(d.getTime()) };
         }
+        if (preset === '+1m') {
+            return { field: 'startTime', value: formatLocalDateTime(baseMs + 60 * 1000) };
+        }
+        if (preset === '+5m') {
+            return { field: 'startTime', value: formatLocalDateTime(baseMs + 5 * 60 * 1000) };
+        }
+        if (preset === 'stop+3m') {
+            const parsedStart = parseLocalDateTime(startTimeStr);
+            const anchorMs = Number.isNaN(parsedStart) ? baseMs : parsedStart;
+            return { field: 'stopTime', value: formatLocalDateTime(anchorMs + 3 * 60 * 1000) };
+        }
+        return null;
     };
 
-    const storageWrite = (key, val) => {
-        try {
-            if (typeof GM_setValue === 'function') GM_setValue(key, val);
-            else localStorage.setItem(`tm_${key}`, String(val));
-        } catch {
-            // 隐私模式或存储受限时忽略持久化失败
+    const createDefaultHostConfig = () => ({
+        targetPid: '',
+        startTime: '',
+        stopTime: '',
+        paymentMethod: 'AliPayH5',
+        speedMs: 500,
+        promoCode: '',
+        soundMuted: false,
+        collapsed: false,
+        panelPos: null,
+    });
+
+    const normalizePanelPos = (pos) => {
+        if (!pos || typeof pos !== 'object') return null;
+        const left = Number(pos.left);
+        const top = Number(pos.top);
+        if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
+        return { left: Math.round(left), top: Math.round(top) };
+    };
+
+    const normalizeHostConfig = (raw) => {
+        const defaults = createDefaultHostConfig();
+        if (!raw || typeof raw !== 'object') return defaults;
+        const parsedSpeed = parseInt(String(raw.speedMs ?? defaults.speedMs), 10);
+        const speedMs = VALID_SPEEDS.includes(parsedSpeed) ? parsedSpeed : defaults.speedMs;
+        const paymentMethod = String(raw.paymentMethod ?? '').trim() || defaults.paymentMethod;
+        return {
+            targetPid: String(raw.targetPid ?? '').trim(),
+            startTime: String(raw.startTime ?? '').trim(),
+            stopTime: String(raw.stopTime ?? '').trim(),
+            paymentMethod,
+            speedMs,
+            promoCode: String(raw.promoCode ?? '').trim(),
+            soundMuted: Boolean(raw.soundMuted),
+            collapsed: Boolean(raw.collapsed),
+            panelPos: normalizePanelPos(raw.panelPos),
+        };
+    };
+
+    const getHostConfigKey = (host) => `${HOST_CONFIG_PREFIX}${String(host || '').toLowerCase()}`;
+
+    const loadHostConfig = (host, store) => {
+        const key = getHostConfigKey(host);
+        const storedRaw = store.get(key, MISSING_SENTINEL);
+        if (storedRaw !== MISSING_SENTINEL && storedRaw !== null && storedRaw !== undefined && storedRaw !== '') {
+            try {
+                const parsed = typeof storedRaw === 'string' ? JSON.parse(storedRaw) : storedRaw;
+                if (parsed && typeof parsed === 'object') {
+                    return { config: normalizeHostConfig(parsed), migrated: false };
+                }
+            } catch {
+                // JSON 损坏时回退至迁移/默认值
+            }
         }
+
+        let hasLegacy = false;
+        const legacyData = {};
+        for (const legacyKey of LEGACY_KEYS) {
+            const value = store.get(legacyKey, MISSING_SENTINEL);
+            if (value !== MISSING_SENTINEL && value !== null && value !== undefined) {
+                hasLegacy = true;
+                legacyData[legacyKey] = value;
+            }
+        }
+
+        const config = normalizeHostConfig(hasLegacy ? legacyData : {});
+        if (hasLegacy) {
+            store.set(key, JSON.stringify(config));
+        }
+        return { config, migrated: hasLegacy };
+    };
+
+    const saveHostConfig = (host, patch, store) => {
+        const { config: current } = loadHostConfig(host, store);
+        const next = normalizeHostConfig({ ...current, ...patch });
+        store.set(getHostConfigKey(host), JSON.stringify(next));
+        return next;
+    };
+
+    const resolvePaymentSelection = (paymentMethod) => {
+        const normalized = String(paymentMethod || '').trim() || 'AliPayH5';
+        if (PRESET_PAYMENT_METHODS.includes(normalized)) {
+            return { selectValue: normalized, customValue: '', isCustom: false };
+        }
+        return { selectValue: CUSTOM_PAYMENT_OPTION, customValue: normalized, isCustom: true };
+    };
+
+    const resolvePaymentInput = (selectValue, customValue) => {
+        if (selectValue === CUSTOM_PAYMENT_OPTION) {
+            return String(customValue || '').trim();
+        }
+        return String(selectValue || '').trim();
+    };
+
+    const computeClockCalibration = (pairs) => {
+        if (!Array.isArray(pairs) || pairs.length === 0) return null;
+        const valid = pairs.filter((p) => p && Number.isFinite(p.delta) && Number.isFinite(p.rtt));
+        if (valid.length === 0) return null;
+        const sorted = [...valid].sort((a, b) => a.rtt - b.rtt);
+        const trimmed = sorted.length > 2 ? sorted.slice(1, -1) : sorted;
+        const avgDelta = Math.round(trimmed.reduce((sum, p) => sum + p.delta, 0) / trimmed.length);
+        const avgRtt = Math.round(trimmed.reduce((sum, p) => sum + p.rtt, 0) / trimmed.length);
+        return { avgDelta, avgRtt, usedCount: trimmed.length, totalCount: valid.length };
+    };
+
+    const computeSchedulePlan = ({
+        targetMs,
+        nowMs,
+        serverTimeDelta = 0,
+        preSyncLeadMs = PRE_SYNC_LEAD_MS,
+        sprintLeadMs = SPRINT_LEAD_MS,
+    }) => {
+        const serverNowMs = nowMs + serverTimeDelta;
+        const remainMs = targetMs - serverNowMs;
+        const shouldStartPolling = remainMs <= 0;
+        const shouldPreSync = !shouldStartPolling && remainMs > preSyncLeadMs + 1000;
+        const preSyncDelayMs = shouldPreSync ? remainMs - preSyncLeadMs : null;
+        const shouldSprintImmediately = !shouldStartPolling && remainMs <= sprintLeadMs;
+        const sprintDelayMs = shouldStartPolling ? 0 : Math.max(0, remainMs - sprintLeadMs);
+        return {
+            serverNowMs,
+            remainMs,
+            shouldStartPolling,
+            shouldPreSync,
+            preSyncDelayMs,
+            shouldSprintImmediately,
+            sprintDelayMs,
+        };
+    };
+
+    const parsePidList = (raw) => {
+        const seen = new Set();
+        const result = [];
+        for (const item of String(raw || '').split(/[,，|\s]+/)) {
+            const trimmed = item.trim();
+            if (trimmed && !seen.has(trimmed)) {
+                seen.add(trimmed);
+                result.push(trimmed);
+            }
+        }
+        return result;
+    };
+
+    const isOutOfStockHtml = (html) => {
+        const text = String(html || '');
+        return text.includes('未到时间') || text.includes('缺货') || /out of stock/i.test(text);
+    };
+
+    const isInvoiceUrl = (url) => {
+        const lower = String(url || '').toLowerCase();
+        return lower.includes('viewinvoice') || lower.includes('viewbilling') || lower.includes('invoice');
+    };
+
+    const isLoginRedirect = (url, html = '') => {
+        const rawUrl = String(url || '').trim();
+        const lowerUrl = rawUrl.toLowerCase();
+        let pathname = lowerUrl;
+        let search = '';
+        try {
+            const parsed = new URL(rawUrl, 'https://placeholder.local');
+            pathname = parsed.pathname.toLowerCase();
+            search = parsed.search.toLowerCase();
+        } catch {
+            const idx = lowerUrl.indexOf('?');
+            if (idx >= 0) {
+                pathname = lowerUrl.slice(0, idx);
+                search = lowerUrl.slice(idx);
+            }
+        }
+        if (/\/(login|dologin|signin)(\.php)?(\/|$)/.test(pathname) || /[?&]action=login(&|$)/.test(search)) {
+            return true;
+        }
+        if (isInvoiceUrl(pathname + search) || /[?&]action=(configureproduct|viewcart)(&|$)/.test(search)) {
+            return false;
+        }
+        const text = String(html || '');
+        return (
+            /name=["']?username["']?/i.test(text) &&
+            /type=["']?password["']?/i.test(text) &&
+            !/frmConfigureProduct/i.test(text)
+        );
+    };
+
+    const extractFormFields = (form, currentPid, { nowMs = Date.now(), fallbackPassword = () => 'VdsFallback#2026' } = {}) => {
+        if (!form || typeof form.querySelectorAll !== 'function') return null;
+        const fields = {};
+
+        for (const input of form.querySelectorAll('input') || []) {
+            if (!input.name || input.disabled) continue;
+            const type = String(input.type || 'text').toLowerCase();
+            if (type === 'radio' || type === 'checkbox') {
+                if (input.checked) fields[input.name] = input.value ?? '';
+            } else if (type !== 'file' && type !== 'reset' && type !== 'button') {
+                fields[input.name] = input.value ?? '';
+            }
+        }
+
+        for (const sel of form.querySelectorAll('select') || []) {
+            if (!sel.name || sel.disabled) continue;
+            const opt =
+                (typeof sel.querySelector === 'function' && (sel.querySelector('option[selected]') || sel.querySelector('option'))) ||
+                null;
+            fields[sel.name] = opt ? (opt.value ?? '') : (sel.value ?? '');
+        }
+
+        for (const ta of form.querySelectorAll('textarea') || []) {
+            if (!ta.name || ta.disabled) continue;
+            fields[ta.name] = ta.value ?? '';
+        }
+
+        fields.pid = String(currentPid);
+        fields.qty = '1';
+        if ('host' in fields && !fields.host) fields.host = `vps-${nowMs}`;
+        if ('password' in fields && !fields.password) fields.password = fallbackPassword();
+        return fields;
+    };
+
+    const buildCheckoutPayload = ({ paymentMethod, promoCode = '', notes = '' }) => {
+        const params = new URLSearchParams();
+        params.append('register_or_login', 'register');
+        params.append('notes', String(notes || ''));
+        params.append('payment', String(paymentMethod || ''));
+        params.append('terms', '1');
+        params.append('promo', String(promoCode || '').trim());
+        params.append('riskToken', '');
+        return params;
+    };
+
+    const clampPanelPosition = (pos, viewportWidth, viewportHeight, panelWidth, panelHeight, margin = 8) => {
+        if (!pos) return null;
+        const maxX = Math.max(margin, viewportWidth - panelWidth - margin);
+        const maxY = Math.max(margin, viewportHeight - panelHeight - margin);
+        return {
+            left: Math.min(maxX, Math.max(margin, Math.round(pos.left))),
+            top: Math.min(maxY, Math.max(margin, Math.round(pos.top))),
+        };
+    };
+
+    const core = {
+        VERSION,
+        HOST_CONFIG_PREFIX,
+        PRESET_PAYMENT_METHODS,
+        CUSTOM_PAYMENT_OPTION,
+        VALID_SPEEDS,
+        PRE_SYNC_LEAD_MS,
+        SPRINT_LEAD_MS,
+        MISSING_SENTINEL,
+        formatLocalDateTime,
+        parseLocalDateTime,
+        toDateTimeLocal,
+        fromDateTimeLocal,
+        formatCountdown,
+        computeTimePreset,
+        createDefaultHostConfig,
+        normalizePanelPos,
+        normalizeHostConfig,
+        getHostConfigKey,
+        loadHostConfig,
+        saveHostConfig,
+        resolvePaymentSelection,
+        resolvePaymentInput,
+        computeClockCalibration,
+        computeSchedulePlan,
+        parsePidList,
+        isOutOfStockHtml,
+        isInvoiceUrl,
+        isLoginRedirect,
+        extractFormFields,
+        buildCheckoutPayload,
+        clampPanelPosition,
+    };
+
+    // Node 环境下仅导出纯逻辑以便自动化单元测试，不触碰浏览器 DOM
+    if (typeof module !== 'undefined' && module.exports) {
+        module.exports = core;
+        return;
+    }
+
+    // --------------------------------------------
+    // 浏览器存储适配器（GM 存储优先，回退 localStorage）
+    // --------------------------------------------
+    const gmStore = {
+        get(key, defaultVal) {
+            try {
+                if (typeof GM_getValue === 'function') return GM_getValue(key, defaultVal);
+                const v = localStorage.getItem(`tm_${key}`);
+                return v !== null ? v : defaultVal;
+            } catch {
+                return defaultVal;
+            }
+        },
+        set(key, val) {
+            try {
+                if (typeof GM_setValue === 'function') GM_setValue(key, val);
+                else localStorage.setItem(`tm_${key}`, String(val));
+            } catch {
+                // 隐私模式或存储受限时忽略持久化失败
+            }
+        },
     };
 
     const readSessionLogs = () => {
@@ -104,7 +453,7 @@
     // --------------------------------------------
     function getEnabledHosts() {
         try {
-            const hosts = JSON.parse(storageRead(ENABLED_HOSTS_KEY, '[]'));
+            const hosts = JSON.parse(gmStore.get(ENABLED_HOSTS_KEY, '[]'));
             return Array.isArray(hosts) ? hosts : [];
         } catch {
             return [];
@@ -124,7 +473,7 @@
                 const nextHosts = isCurrentHostEnabled
                     ? enabledHosts.filter((host) => host !== currentHost)
                     : [...new Set([...enabledHosts, currentHost])];
-                storageWrite(ENABLED_HOSTS_KEY, JSON.stringify(nextHosts));
+                gmStore.set(ENABLED_HOSTS_KEY, JSON.stringify(nextHosts));
                 location.reload();
             }
         );
@@ -132,12 +481,16 @@
 
     if (!isCurrentHostEnabled) return;
 
-    let targetPid = String(storageRead('targetPid', '') || '');
-    let startTime = String(storageRead('startTime', '') || '');
-    let stopTime = String(storageRead('stopTime', '') || '');
-    let paymentMethod = String(storageRead('paymentMethod', 'AliPayH5') || 'AliPayH5');
-    let speedMs = parseInt(storageRead('speedMs', '500'), 10);
-    if (![500, 100, 10].includes(speedMs)) speedMs = 500;
+    // --------------------------------------------
+    // 按域名加载配置（首次自动兼容迁移旧版全局键）
+    // --------------------------------------------
+    const initialLoad = loadHostConfig(currentHost, gmStore);
+    let hostConfig = initialLoad.config;
+
+    function persistConfig(patch) {
+        hostConfig = saveHostConfig(currentHost, patch, gmStore);
+        return hostConfig;
+    }
 
     // --------------------------------------------
     // 构建 Shadow DOM 悬浮控制面板
@@ -156,7 +509,7 @@
             }
             * { box-sizing: border-box; }
             .vds-card {
-                width: 356px;
+                width: 364px;
                 background: rgba(13, 17, 24, 0.94);
                 color: #e6edf3;
                 border: 1px solid rgba(148, 163, 184, 0.22);
@@ -169,20 +522,21 @@
                 line-height: 1.45;
                 user-select: none;
             }
-            .vds-card.collapsed { width: auto; min-width: 224px; }
+            .vds-card.collapsed { width: auto; min-width: 248px; }
             .vds-header {
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
                 gap: 8px;
-                padding: 11px 14px;
+                padding: 10px 13px;
                 background: linear-gradient(180deg, rgba(30, 41, 59, 0.65), rgba(15, 23, 42, 0.35));
                 border-bottom: 1px solid rgba(148, 163, 184, 0.14);
                 cursor: grab;
             }
             .vds-header:active { cursor: grabbing; }
             .vds-card.collapsed .vds-header { border-bottom: none; }
-            .vds-title-wrap { display: flex; align-items: center; gap: 8px; min-width: 0; }
+            .vds-title-wrap { display: flex; align-items: center; gap: 7px; min-width: 0; }
+            .vds-head-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
             .vds-dot {
                 width: 8px;
                 height: 8px;
@@ -215,10 +569,18 @@
                 padding: 3px 8px;
                 font-size: 11px;
                 cursor: pointer;
-                transition: background 0.15s, color 0.15s;
+                transition: background 0.15s, color 0.15s, border-color 0.15s;
             }
             .vds-toggle:hover { background: rgba(148, 163, 184, 0.22); color: #fff; }
-            .vds-body { padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 11px; }
+            .vds-toggle.muted { color: #94a3b8; border-color: rgba(148, 163, 184, 0.14); opacity: 0.8; }
+            .vds-body {
+                padding: 11px 13px 13px;
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                max-height: calc(100vh - 64px);
+                overflow-y: auto;
+            }
             .vds-card.collapsed .vds-body { display: none; }
 
             .vds-telemetry {
@@ -272,11 +634,12 @@
             .vds-form { display: flex; flex-direction: column; gap: 8px; }
             .vds-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
             .vds-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+            .vds-field.hidden { display: none; }
             .vds-label { font-size: 11px; color: #94a3b8; display: flex; justify-content: space-between; }
             .vds-hint { color: #64748b; font-size: 10.5px; }
             .vds-input, .vds-select {
                 width: 100%;
-                height: 31px;
+                height: 30px;
                 padding: 0 9px;
                 background: rgba(15, 23, 42, 0.85);
                 border: 1px solid rgba(148, 163, 184, 0.22);
@@ -293,6 +656,34 @@
                 box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
             }
             .vds-input:disabled, .vds-select:disabled { opacity: 0.55; cursor: not-allowed; }
+
+            .vds-presets {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 5px;
+                margin-top: 2px;
+            }
+            .vds-pill {
+                flex: 1 1 auto;
+                height: 24px;
+                padding: 0 8px;
+                border-radius: 999px;
+                background: rgba(56, 189, 248, 0.1);
+                border: 1px solid rgba(56, 189, 248, 0.26);
+                color: #bae6fd;
+                font-size: 11px;
+                font-weight: 500;
+                cursor: pointer;
+                transition: background 0.15s, border-color 0.15s, color 0.15s;
+                white-space: nowrap;
+            }
+            .vds-pill:hover:not(:disabled) {
+                background: rgba(56, 189, 248, 0.22);
+                border-color: rgba(56, 189, 248, 0.55);
+                color: #fff;
+            }
+            .vds-pill:disabled { opacity: 0.45; cursor: not-allowed; }
+
             .vds-alert {
                 display: none;
                 padding: 7px 9px;
@@ -307,7 +698,7 @@
             .vds-actions { display: flex; gap: 8px; }
             .vds-btn {
                 flex: 1;
-                height: 35px;
+                height: 34px;
                 border: none;
                 border-radius: 8px;
                 font-size: 12.5px;
@@ -332,13 +723,13 @@
 
             .vds-log-section {
                 border-top: 1px solid rgba(148, 163, 184, 0.14);
-                padding-top: 9px;
+                padding-top: 8px;
             }
             .vds-log-head {
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
-                margin-bottom: 6px;
+                margin-bottom: 5px;
                 font-size: 11px;
                 color: #94a3b8;
             }
@@ -356,7 +747,7 @@
                 background: rgba(2, 6, 23, 0.72);
                 border: 1px solid rgba(148, 163, 184, 0.14);
                 border-radius: 8px;
-                height: 132px;
+                height: 124px;
                 overflow-y: auto;
                 padding: 7px 9px;
                 font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
@@ -380,7 +771,10 @@
                     <span class="vds-title">VPS Drop Sync</span>
                     <span class="vds-badge">v${VERSION}</span>
                 </div>
-                <button type="button" class="vds-toggle" id="vds-toggle">收起</button>
+                <div class="vds-head-actions">
+                    <button type="button" class="vds-toggle" id="vds-sound-toggle" title="切换声音提示开关">音效开</button>
+                    <button type="button" class="vds-toggle" id="vds-toggle">收起</button>
+                </div>
             </header>
 
             <div class="vds-body">
@@ -411,7 +805,7 @@
                     <div class="vds-field">
                         <label class="vds-label" for="vds-pid">
                             <span>目标商品 PID</span>
-                            <span class="vds-hint">多个用逗号分隔</span>
+                            <span class="vds-hint">多个用逗号分隔 · 按当前域名隔离</span>
                         </label>
                         <input type="text" id="vds-pid" class="vds-input" placeholder="例如：2159, 2160">
                     </div>
@@ -422,6 +816,12 @@
                             <span class="vds-hint">精确到秒</span>
                         </label>
                         <input type="datetime-local" id="vds-time" step="1" class="vds-input">
+                        <div class="vds-presets" id="vds-presets">
+                            <button type="button" class="vds-pill" data-preset="next-hour">下一整点</button>
+                            <button type="button" class="vds-pill" data-preset="+1m">+1m</button>
+                            <button type="button" class="vds-pill" data-preset="+5m">+5m</button>
+                            <button type="button" class="vds-pill" data-preset="stop+3m">停止=+3m</button>
+                        </div>
                     </div>
 
                     <div class="vds-field">
@@ -439,6 +839,7 @@
                                 <option value="AliPayH5">支付宝 (AliPayH5)</option>
                                 <option value="wechatpay">微信支付</option>
                                 <option value="paypal">PayPal</option>
+                                <option value="__custom__">自定义网关...</option>
                             </select>
                         </div>
                         <div class="vds-field">
@@ -449,6 +850,22 @@
                                 <option value="10">极限 (10ms)</option>
                             </select>
                         </div>
+                    </div>
+
+                    <div class="vds-field hidden" id="vds-pay-custom-wrap">
+                        <label class="vds-label" for="vds-pay-custom">
+                            <span>自定义付款方式</span>
+                            <span class="vds-hint">填写表单 payment 字段值</span>
+                        </label>
+                        <input type="text" id="vds-pay-custom" class="vds-input" placeholder="例如：stripe / alipay / credit">
+                    </div>
+
+                    <div class="vds-field">
+                        <label class="vds-label" for="vds-promo">
+                            <span>优惠码</span>
+                            <span class="vds-hint">可选，结账自动填入 promo</span>
+                        </label>
+                        <input type="text" id="vds-promo" class="vds-input" placeholder="留空则不使用优惠码">
                     </div>
                 </div>
 
@@ -472,11 +889,12 @@
     document.body.appendChild(hostEl);
 
     // --------------------------------------------
-    // DOM 引用与初始值安全回填（不走 innerHTML 插值）
+    // DOM 引用与按域名配置回填（无 innerHTML 插值）
     // --------------------------------------------
     const $ = (id) => shadow.getElementById(id);
     const cardEl = $('vds-card');
     const dragEl = $('vds-drag');
+    const soundToggleBtn = $('vds-sound-toggle');
     const toggleBtn = $('vds-toggle');
     const dotEl = $('vds-dot');
     const statusEl = $('vds-status');
@@ -488,8 +906,12 @@
     const pidInput = $('vds-pid');
     const timeInput = $('vds-time');
     const stopTimeInput = $('vds-stoptime');
+    const presetButtons = Array.from(shadow.querySelectorAll('.vds-pill'));
     const paySelect = $('vds-pay');
+    const payCustomWrap = $('vds-pay-custom-wrap');
+    const payCustomInput = $('vds-pay-custom');
     const speedSelect = $('vds-speed');
+    const promoInput = $('vds-promo');
     const alertEl = $('vds-alert');
     const startBtn = $('vds-start');
     const stopBtn = $('vds-stop');
@@ -497,41 +919,303 @@
     const clearBtn = $('vds-clear');
     const hostLabelEl = $('vds-host-label');
 
+    function syncPaymentUi(paymentMethod) {
+        const resolved = resolvePaymentSelection(paymentMethod);
+        paySelect.value = resolved.selectValue;
+        payCustomInput.value = resolved.customValue;
+        payCustomWrap.classList.toggle('hidden', !resolved.isCustom);
+    }
+
+    function syncSoundUi() {
+        soundToggleBtn.textContent = hostConfig.soundMuted ? '已静音' : '音效开';
+        soundToggleBtn.classList.toggle('muted', hostConfig.soundMuted);
+    }
+
+    function syncCollapsedUi() {
+        cardEl.classList.toggle('collapsed', hostConfig.collapsed);
+        toggleBtn.textContent = hostConfig.collapsed ? '展开' : '收起';
+    }
+
+    function applySavedPanelPos() {
+        if (!hostConfig.panelPos) return;
+        const clamped = clampPanelPosition(
+            hostConfig.panelPos,
+            window.innerWidth,
+            window.innerHeight,
+            hostEl.offsetWidth || 364,
+            hostEl.offsetHeight || 120
+        );
+        if (!clamped) return;
+        hostEl.style.left = `${clamped.left}px`;
+        hostEl.style.top = `${clamped.top}px`;
+        hostEl.style.right = 'auto';
+    }
+
     hostLabelEl.textContent = `运行日志 · ${currentHost}`;
-    pidInput.value = targetPid;
-    timeInput.value = toDateTimeLocal(startTime);
-    stopTimeInput.value = toDateTimeLocal(stopTime);
-    paySelect.value = paymentMethod;
-    speedSelect.value = String(speedMs);
+    pidInput.value = hostConfig.targetPid;
+    timeInput.value = toDateTimeLocal(hostConfig.startTime);
+    stopTimeInput.value = toDateTimeLocal(hostConfig.stopTime);
+    syncPaymentUi(hostConfig.paymentMethod);
+    speedSelect.value = String(hostConfig.speedMs);
+    promoInput.value = hostConfig.promoCode;
+    syncSoundUi();
+    syncCollapsedUi();
+    applySavedPanelPos();
+
+    window.addEventListener('resize', applySavedPanelPos);
 
     // --------------------------------------------
-    // 面板折叠与拖拽定位
+    // 多通道强提醒（AudioContext + GM/Web 通知 + 标题闪烁）
     // --------------------------------------------
+    const soundEngine = (() => {
+        let ctx = null;
+
+        function ensureContext() {
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (!AudioCtx) return null;
+            if (!ctx) ctx = new AudioCtx();
+            if (ctx.state === 'suspended') {
+                ctx.resume().catch(() => {});
+            }
+            return ctx;
+        }
+
+        function playSequence(notes) {
+            if (hostConfig.soundMuted) return false;
+            const audio = ensureContext();
+            if (!audio) return false;
+            try {
+                const start = audio.currentTime + 0.02;
+                let offset = 0;
+                for (const note of notes) {
+                    const osc = audio.createOscillator();
+                    const gain = audio.createGain();
+                    osc.type = note.type || 'triangle';
+                    osc.frequency.setValueAtTime(note.freq, start + offset);
+
+                    const dur = note.dur || 0.14;
+                    gain.gain.setValueAtTime(0.0001, start + offset);
+                    gain.gain.exponentialRampToValueAtTime(note.vol || 0.18, start + offset + 0.015);
+                    gain.gain.exponentialRampToValueAtTime(0.0001, start + offset + dur);
+
+                    osc.connect(gain);
+                    gain.connect(audio.destination);
+                    osc.start(start + offset);
+                    osc.stop(start + offset + dur + 0.02);
+                    offset += note.step || dur + 0.04;
+                }
+                return true;
+            } catch {
+                return false;
+            }
+        }
+
+        return {
+            unlock: ensureContext,
+            playSuccess: () =>
+                playSequence([
+                    { freq: 523.25, dur: 0.13, step: 0.13, vol: 0.18 },
+                    { freq: 659.25, dur: 0.13, step: 0.13, vol: 0.2 },
+                    { freq: 783.99, dur: 0.15, step: 0.16, vol: 0.22 },
+                    { freq: 1046.5, dur: 0.32, step: 0.34, vol: 0.24 },
+                ]),
+            playAlert: () =>
+                playSequence([
+                    { freq: 440.0, dur: 0.18, step: 0.22, type: 'sawtooth', vol: 0.12 },
+                    { freq: 329.63, dur: 0.28, step: 0.3, type: 'sawtooth', vol: 0.12 },
+                ]),
+            playPreview: () =>
+                playSequence([
+                    { freq: 659.25, dur: 0.08, step: 0.09, vol: 0.14 },
+                    { freq: 880.0, dur: 0.12, step: 0.14, vol: 0.16 },
+                ]),
+        };
+    })();
+
+    const titleFlasher = (() => {
+        let baseTitle = document.title;
+        let timer = null;
+        let autoStopTimer = null;
+        let showingAlert = false;
+
+        function stop() {
+            if (timer) {
+                clearInterval(timer);
+                timer = null;
+            }
+            if (autoStopTimer) {
+                clearTimeout(autoStopTimer);
+                autoStopTimer = null;
+            }
+            if (showingAlert) {
+                document.title = baseTitle;
+                showingAlert = false;
+            }
+        }
+
+        function start(prefix, maxDurationMs = 300000) {
+            stop();
+            baseTitle = document.title;
+            showingAlert = true;
+            document.title = `${prefix} ${baseTitle}`;
+            timer = setInterval(() => {
+                showingAlert = !showingAlert;
+                document.title = showingAlert ? `${prefix} ${baseTitle}` : baseTitle;
+            }, 650);
+            autoStopTimer = setTimeout(stop, maxDurationMs);
+        }
+
+        window.addEventListener('focus', stop);
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') stop();
+        });
+
+        return { start, stop };
+    })();
+
+    function sendDesktopNotification(title, text) {
+        try {
+            if (typeof GM_notification === 'function') {
+                GM_notification({
+                    title,
+                    text,
+                    timeout: 15000,
+                    silent: Boolean(hostConfig.soundMuted),
+                    onclick: () => {
+                        try {
+                            window.focus();
+                        } catch {
+                            // 忽略浏览器聚焦限制
+                        }
+                    },
+                });
+                return true;
+            }
+        } catch {
+            // 降级至标准 Web Notification
+        }
+
+        try {
+            if (typeof Notification === 'function') {
+                if (Notification.permission === 'granted') {
+                    const n = new Notification(title, { body: text, silent: Boolean(hostConfig.soundMuted) });
+                    n.onclick = () => {
+                        try {
+                            window.focus();
+                        } catch {}
+                    };
+                    return true;
+                }
+                if (Notification.permission === 'default') {
+                    Notification.requestPermission()
+                        .then((perm) => {
+                            if (perm === 'granted') {
+                                const n = new Notification(title, {
+                                    body: text,
+                                    silent: Boolean(hostConfig.soundMuted),
+                                });
+                                n.onclick = () => {
+                                    try {
+                                        window.focus();
+                                    } catch {}
+                                };
+                            }
+                        })
+                        .catch(() => {});
+                }
+            }
+        } catch {
+            // 忽略不支持或权限受限场景
+        }
+        return false;
+    }
+
+    function triggerAlert(kind, title, message) {
+        sendDesktopNotification(title, message);
+        if (kind === 'success') {
+            soundEngine.playSuccess();
+            titleFlasher.start('【锁单成功】');
+        } else {
+            soundEngine.playAlert();
+            titleFlasher.start('【任务停止】');
+        }
+    }
+
+    // --------------------------------------------
+    // 面板交互（静音、折叠、拖拽、快捷时间、表单持久化）
+    // --------------------------------------------
+    soundToggleBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        persistConfig({ soundMuted: !hostConfig.soundMuted });
+        syncSoundUi();
+        if (!hostConfig.soundMuted) {
+            soundEngine.unlock();
+            soundEngine.playPreview();
+        }
+    });
+
     toggleBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        const collapsed = cardEl.classList.toggle('collapsed');
-        toggleBtn.textContent = collapsed ? '展开' : '收起';
+        persistConfig({ collapsed: !hostConfig.collapsed });
+        syncCollapsedUi();
+        applySavedPanelPos();
     });
 
     let dragState = null;
     dragEl.addEventListener('pointerdown', (e) => {
-        if (e.target === toggleBtn) return;
+        if (e.target === toggleBtn || e.target === soundToggleBtn) return;
         const rect = hostEl.getBoundingClientRect();
         dragState = { offsetX: e.clientX - rect.left, offsetY: e.clientY - rect.top };
         dragEl.setPointerCapture(e.pointerId);
     });
     dragEl.addEventListener('pointermove', (e) => {
         if (!dragState) return;
-        const maxX = Math.max(8, window.innerWidth - hostEl.offsetWidth - 8);
-        const maxY = Math.max(8, window.innerHeight - hostEl.offsetHeight - 8);
-        const nextX = Math.min(maxX, Math.max(8, e.clientX - dragState.offsetX));
-        const nextY = Math.min(maxY, Math.max(8, e.clientY - dragState.offsetY));
-        hostEl.style.left = `${nextX}px`;
-        hostEl.style.top = `${nextY}px`;
+        const clamped = clampPanelPosition(
+            { left: e.clientX - dragState.offsetX, top: e.clientY - dragState.offsetY },
+            window.innerWidth,
+            window.innerHeight,
+            hostEl.offsetWidth,
+            hostEl.offsetHeight
+        );
+        if (!clamped) return;
+        hostEl.style.left = `${clamped.left}px`;
+        hostEl.style.top = `${clamped.top}px`;
         hostEl.style.right = 'auto';
     });
-    dragEl.addEventListener('pointerup', () => { dragState = null; });
-    dragEl.addEventListener('pointercancel', () => { dragState = null; });
+    const finishDrag = () => {
+        if (!dragState) return;
+        dragState = null;
+        const rect = hostEl.getBoundingClientRect();
+        persistConfig({ panelPos: { left: rect.left, top: rect.top } });
+    };
+    dragEl.addEventListener('pointerup', finishDrag);
+    dragEl.addEventListener('pointercancel', finishDrag);
+
+    paySelect.addEventListener('change', () => {
+        const isCustom = paySelect.value === CUSTOM_PAYMENT_OPTION;
+        payCustomWrap.classList.toggle('hidden', !isCustom);
+        if (isCustom) {
+            payCustomInput.focus();
+        } else {
+            persistConfig({ paymentMethod: paySelect.value });
+        }
+    });
+
+    const saveCurrentFormDraft = () => {
+        const resolvedPayment = resolvePaymentInput(paySelect.value, payCustomInput.value);
+        persistConfig({
+            targetPid: pidInput.value.trim(),
+            startTime: fromDateTimeLocal(timeInput.value),
+            stopTime: fromDateTimeLocal(stopTimeInput.value),
+            paymentMethod: resolvedPayment || hostConfig.paymentMethod,
+            speedMs: parseInt(speedSelect.value, 10) || 500,
+            promoCode: promoInput.value.trim(),
+        });
+    };
+
+    [pidInput, timeInput, stopTimeInput, payCustomInput, speedSelect, promoInput].forEach((el) => {
+        el.addEventListener('change', saveCurrentFormDraft);
+    });
 
     // --------------------------------------------
     // 状态、日志与 Wake Lock 管理
@@ -541,12 +1225,33 @@
     let timeChecker = null;
     let preSyncTimer = null;
     let precisionTimer = null;
+    let redirectTimer = null;
+    let inSprintMode = false;
     let wakeLock = null;
     let serverTimeDelta = 0;
 
     function serverNow() {
         return Date.now() + serverTimeDelta;
     }
+
+    presetButtons.forEach((btn) => {
+        btn.addEventListener('click', () => {
+            if (isRunning) return;
+            const preset = btn.getAttribute('data-preset');
+            const result = computeTimePreset(preset, {
+                nowMs: serverNow(),
+                startTimeStr: fromDateTimeLocal(timeInput.value),
+            });
+            if (!result) return;
+            if (result.field === 'startTime') {
+                timeInput.value = toDateTimeLocal(result.value);
+            } else if (result.field === 'stopTime') {
+                stopTimeInput.value = toDateTimeLocal(result.value);
+            }
+            saveCurrentFormDraft();
+            setAlert('');
+        });
+    });
 
     function setAlert(msg) {
         if (!msg) {
@@ -593,15 +1298,35 @@
         }
     });
 
+    if (initialLoad.migrated) {
+        logMsg(`已将旧版全局配置自动迁移至当前域名（${currentHost}）`, 'sync');
+    }
+
     clearBtn.addEventListener('click', () => {
-        try { sessionStorage.removeItem(LOG_STORAGE_KEY); } catch {}
+        try {
+            sessionStorage.removeItem(LOG_STORAGE_KEY);
+        } catch {}
         logEl.textContent = '';
     });
 
     function clearAllTimers() {
-        if (timeChecker) { clearInterval(timeChecker); timeChecker = null; }
-        if (preSyncTimer) { clearTimeout(preSyncTimer); preSyncTimer = null; }
-        if (precisionTimer) { clearTimeout(precisionTimer); precisionTimer = null; }
+        if (timeChecker) {
+            clearInterval(timeChecker);
+            timeChecker = null;
+        }
+        if (preSyncTimer) {
+            clearTimeout(preSyncTimer);
+            preSyncTimer = null;
+        }
+        if (precisionTimer) {
+            clearTimeout(precisionTimer);
+            precisionTimer = null;
+        }
+        if (redirectTimer) {
+            clearTimeout(redirectTimer);
+            redirectTimer = null;
+        }
+        inSprintMode = false;
     }
 
     function setControlsDisabled(disabled) {
@@ -609,7 +1334,12 @@
         timeInput.disabled = disabled;
         stopTimeInput.disabled = disabled;
         paySelect.disabled = disabled;
+        payCustomInput.disabled = disabled;
         speedSelect.disabled = disabled;
+        promoInput.disabled = disabled;
+        presetButtons.forEach((btn) => {
+            btn.disabled = disabled;
+        });
         startBtn.style.display = disabled ? 'none' : 'block';
         stopBtn.style.display = disabled ? 'block' : 'none';
     }
@@ -651,7 +1381,7 @@
 
         const pairs = [];
         for (let i = 0; i < samples; i++) {
-            if (stopFlag) return;
+            if (stopFlag) return null;
             try {
                 const t0 = Date.now();
                 const resp = await fetch('/', { method: 'HEAD', credentials: 'include', cache: 'no-store' });
@@ -670,23 +1400,23 @@
             }
         }
 
-        if (pairs.length === 0) {
+        const result = computeClockCalibration(pairs);
+        if (!result) {
             deltaEl.textContent = '本地时钟';
             rttEl.textContent = '--';
             logMsg(`${label}采样失败，回退本地时钟`, 'warn');
-            return;
+            return null;
         }
 
-        pairs.sort((a, b) => a.rtt - b.rtt);
-        const trimmed = pairs.length > 2 ? pairs.slice(1, -1) : pairs;
-        const avgDelta = Math.round(trimmed.reduce((s, p) => s + p.delta, 0) / trimmed.length);
-        const avgRtt = Math.round(trimmed.reduce((s, p) => s + p.rtt, 0) / trimmed.length);
-
-        serverTimeDelta = avgDelta;
-        const sign = avgDelta > 0 ? '+' : '';
-        deltaEl.textContent = `${sign}${avgDelta}ms`;
-        rttEl.textContent = `${avgRtt}ms`;
-        logMsg(`${label}完成 · 偏差 ${sign}${avgDelta}ms · RTT ${avgRtt}ms (${pairs.length}/${samples})`, 'ok');
+        serverTimeDelta = result.avgDelta;
+        const sign = result.avgDelta > 0 ? '+' : '';
+        deltaEl.textContent = `${sign}${result.avgDelta}ms`;
+        rttEl.textContent = `${result.avgRtt}ms`;
+        logMsg(
+            `${label}完成 · 偏差 ${sign}${result.avgDelta}ms · RTT ${result.avgRtt}ms (${result.totalCount}/${samples})`,
+            'ok'
+        );
+        return result;
     }
 
     // --------------------------------------------
@@ -703,6 +1433,7 @@
     }
 
     stopBtn.addEventListener('click', () => {
+        titleFlasher.stop();
         finishTask('已中止', 'error');
         stageEl.textContent = '任务已手动停止';
         countdownEl.textContent = '--:--:--.-';
@@ -711,20 +1442,26 @@
 
     startBtn.addEventListener('click', async () => {
         setAlert('');
-        targetPid = pidInput.value.trim();
-        startTime = fromDateTimeLocal(timeInput.value);
-        stopTime = fromDateTimeLocal(stopTimeInput.value);
-        paymentMethod = paySelect.value;
-        speedMs = parseInt(speedSelect.value, 10) || 500;
+        titleFlasher.stop();
 
-        storageWrite('targetPid', targetPid);
-        storageWrite('startTime', startTime);
-        storageWrite('stopTime', stopTime);
-        storageWrite('paymentMethod', paymentMethod);
-        storageWrite('speedMs', speedMs);
+        // 在用户点击手势内解锁 AudioContext 与 Web Notification 权限，避免后续被浏览器拦截
+        soundEngine.unlock();
+        if (typeof GM_notification !== 'function' && typeof Notification === 'function' && Notification.permission === 'default') {
+            Notification.requestPermission().catch(() => {});
+        }
 
-        const targetMs = new Date(startTime.replace(/-/g, '/')).getTime();
-        if (!targetPid) {
+        const targetPid = pidInput.value.trim();
+        const pidList = parsePidList(targetPid);
+        const startTime = fromDateTimeLocal(timeInput.value);
+        const stopTime = fromDateTimeLocal(stopTimeInput.value);
+        const paymentMethod = resolvePaymentInput(paySelect.value, payCustomInput.value);
+        const speedMs = parseInt(speedSelect.value, 10) || 500;
+        const promoCode = promoInput.value.trim();
+
+        const targetMs = parseLocalDateTime(startTime);
+        const stopMs = stopTime ? parseLocalDateTime(stopTime) : 0;
+
+        if (pidList.length === 0) {
             setAlert('请先填写至少一个目标商品 PID');
             pidInput.focus();
             return;
@@ -734,6 +1471,25 @@
             timeInput.focus();
             return;
         }
+        if (stopTime && (Number.isNaN(stopMs) || stopMs <= targetMs)) {
+            setAlert('自动停止时间必须晚于开抢时间');
+            stopTimeInput.focus();
+            return;
+        }
+        if (!paymentMethod) {
+            setAlert('请输入自定义付款方式代码');
+            payCustomInput.focus();
+            return;
+        }
+
+        persistConfig({
+            targetPid,
+            startTime,
+            stopTime,
+            paymentMethod,
+            speedMs,
+            promoCode,
+        });
 
         clearAllTimers();
         setControlsDisabled(true);
@@ -741,35 +1497,22 @@
         stopFlag = false;
 
         acquireWakeLock();
-        const stopMs = stopTime ? new Date(stopTime.replace(/-/g, '/')).getTime() : 0;
         if (stopMs > 0) logMsg(`已设自动停止：${stopTime}`, 'info');
+        if (promoCode) logMsg(`结账将自动附带优惠码：${promoCode}`, 'info');
 
         await syncServerTime('启动初校', 3);
         if (!isRunning || stopFlag) return;
 
-        if (serverNow() >= targetMs) {
-            startPolling();
-            return;
-        }
-
-        setStatus('定时待命', 'armed');
-        const preSyncDelay = targetMs - 60000 - serverNow();
-        if (preSyncDelay > 1000) {
-            stageEl.textContent = '开抢前 60 秒自动精校';
-            logMsg('已预约开抢前 60 秒二次精校', 'info');
-            preSyncTimer = setTimeout(async () => {
-                if (!isRunning || stopFlag) return;
-                await syncServerTime('开抢前精校', 5);
-                if (isRunning && !stopFlag) {
-                    setStatus('即将开抢', 'armed');
-                    stageEl.textContent = '二次精校已完成';
-                }
-            }, preSyncDelay);
-        } else {
-            stageEl.textContent = '倒计时同步运行中';
-        }
-
         let lastLogAt = 0;
+
+        const enterSprintInterval = (tickFn) => {
+            if (!isRunning || stopFlag || inSprintMode) return;
+            inSprintMode = true;
+            if (timeChecker) clearInterval(timeChecker);
+            timeChecker = setInterval(() => tickFn(true), 50);
+            tickFn(true);
+        };
+
         const tick = (sprint) => {
             const now = serverNow();
             if (now >= targetMs) {
@@ -783,24 +1526,87 @@
             if (sprint) {
                 countdownBox.classList.add('sprint');
                 stageEl.textContent = '最后 5 秒 · 50ms 高精度触发';
+            } else if (remainMs <= SPRINT_LEAD_MS) {
+                enterSprintInterval(tick);
+                return;
             }
             const remainSec = Math.floor(remainMs / 1000);
             const interval = remainSec > 300 ? 60000 : remainSec > 60 ? 30000 : 15000;
             if (!sprint && now - lastLogAt >= interval) {
                 lastLogAt = now;
-                logMsg(`倒计时 ${formatCountdown(remainMs)}（偏差 ${serverTimeDelta >= 0 ? '+' : ''}${serverTimeDelta}ms）`, 'sync');
+                logMsg(
+                    `倒计时 ${formatCountdown(remainMs)}（偏差 ${serverTimeDelta >= 0 ? '+' : ''}${serverTimeDelta}ms）`,
+                    'sync'
+                );
             }
         };
 
-        tick(false);
-        timeChecker = setInterval(() => tick(false), 200);
+        const schedulePrecisionSprint = (reason) => {
+            if (precisionTimer) {
+                clearTimeout(precisionTimer);
+                precisionTimer = null;
+            }
+            const plan = computeSchedulePlan({
+                targetMs,
+                nowMs: Date.now(),
+                serverTimeDelta,
+            });
 
-        const sprintDelay = Math.max(0, targetMs - serverNow() - 5200);
-        precisionTimer = setTimeout(() => {
-            if (!isRunning || stopFlag) return;
-            if (timeChecker) clearInterval(timeChecker);
-            timeChecker = setInterval(() => tick(true), 50);
-        }, sprintDelay);
+            if (plan.shouldStartPolling) {
+                clearAllTimers();
+                countdownEl.textContent = '00:00:00.0';
+                startPolling();
+                return plan;
+            }
+
+            if (plan.shouldSprintImmediately) {
+                enterSprintInterval(tick);
+                return plan;
+            }
+
+            precisionTimer = setTimeout(() => {
+                enterSprintInterval(tick);
+            }, plan.sprintDelayMs);
+
+            if (reason === 'recalibrated') {
+                const sign = serverTimeDelta > 0 ? '+' : '';
+                logMsg(
+                    `已按最新时钟偏差（${sign}${serverTimeDelta}ms）重算冲刺定时（${Math.round(plan.sprintDelayMs)}ms 后切换 50ms）`,
+                    'sync'
+                );
+            }
+            return plan;
+        };
+
+        const initialPlan = schedulePrecisionSprint('initial');
+        if (!isRunning || stopFlag || initialPlan.shouldStartPolling) return;
+
+        setStatus('定时待命', 'armed');
+        if (initialPlan.shouldPreSync && initialPlan.preSyncDelayMs !== null) {
+            stageEl.textContent = '开抢前 60 秒自动精校';
+            logMsg('已预约开抢前 60 秒二次精校', 'info');
+            preSyncTimer = setTimeout(async () => {
+                if (!isRunning || stopFlag) return;
+                await syncServerTime('开抢前精校', 5);
+                if (!isRunning || stopFlag) return;
+                const recalibratedPlan = schedulePrecisionSprint('recalibrated');
+                if (isRunning && !stopFlag && !recalibratedPlan.shouldStartPolling) {
+                    setStatus('即将开抢', 'armed');
+                    if (!recalibratedPlan.shouldSprintImmediately) {
+                        stageEl.textContent = '二次精校已完成 · 定时已重算';
+                    }
+                }
+            }, initialPlan.preSyncDelayMs);
+        } else if (!initialPlan.shouldSprintImmediately) {
+            stageEl.textContent = '倒计时同步运行中';
+        }
+
+        if (!inSprintMode) {
+            tick(false);
+            if (isRunning && !stopFlag && !inSprintMode) {
+                timeChecker = setInterval(() => tick(false), 200);
+            }
+        }
     });
 
     function startPolling() {
@@ -817,135 +1623,147 @@
     // --------------------------------------------
     async function loopConfigAndBuy() {
         let attempt = 1;
-        const pidList = targetPid.split(/[,，|\s]+/).map((p) => p.trim()).filter(Boolean);
-        const stopMs = stopTime ? new Date(stopTime.replace(/-/g, '/')).getTime() : 0;
+        const pidList = parsePidList(hostConfig.targetPid);
+        const stopMs = hostConfig.stopTime ? parseLocalDateTime(hostConfig.stopTime) : 0;
 
-        while (isRunning && !stopFlag) {
-            if (stopMs > 0 && serverNow() >= stopMs) {
-                logMsg(`已达停止时间 ${stopTime}，自动结束`, 'warn');
-                stageEl.textContent = '已超时自动停止';
-                finishTask('已超时停止', 'idle');
-                return;
-            }
-
-            try {
-                let grabbed = false;
-
-                for (const currentPid of pidList) {
-                    if (!isRunning || stopFlag) break;
-
-                    const t0 = Date.now();
-                    await fetch('/cart?action=emptycart', { method: 'GET', credentials: 'include' }).catch(() => {});
-
-                    const configUrl = `/cart?action=configureproduct&pid=${encodeURIComponent(currentPid)}`;
-                    logMsg(`[#${attempt}] 探测 PID ${currentPid}`, 'sync');
-
-                    const resp = await fetch(`${configUrl}&nocache=${Date.now()}`, {
-                        redirect: 'follow',
-                        credentials: 'include',
-                    });
-                    const html = await resp.text();
-                    const t1 = Date.now();
-
-                    if (html.includes('未到时间') || html.includes('缺货') || html.includes('Out of Stock')) {
-                        logMsg(`PID ${currentPid} 暂无库存 (${resp.status} · ${t1 - t0}ms)`, 'warn');
-                        continue;
-                    }
-
-                    const doc = new DOMParser().parseFromString(html, 'text/html');
-                    const form = doc.getElementById('frmConfigureProduct') || doc.querySelector('form');
-                    if (!form) {
-                        logMsg(`PID ${currentPid} 页面未检测到配置表单，跳过`, 'warn');
-                        continue;
-                    }
-
-                    const fields = {};
-                    form.querySelectorAll('input').forEach((input) => {
-                        if (!input.name) return;
-                        if (input.type === 'radio' || input.type === 'checkbox') {
-                            if (input.checked) fields[input.name] = input.value;
-                        } else {
-                            fields[input.name] = input.value;
-                        }
-                    });
-                    form.querySelectorAll('select').forEach((sel) => {
-                        if (!sel.name) return;
-                        const opt = sel.querySelector('option[selected]') || sel.querySelector('option');
-                        fields[sel.name] = opt ? opt.value : sel.value;
-                    });
-
-                    fields.pid = currentPid;
-                    fields.qty = '1';
-                    if ('host' in fields && !fields.host) fields.host = `vps-${Date.now()}`;
-                    if ('password' in fields && !fields.password) fields.password = generateFallbackPassword();
-
-                    logMsg(`PID ${currentPid} 有货，提交加购 (${Object.keys(fields).length} 字段)`, 'ok');
-                    const formData = new URLSearchParams();
-                    for (const [k, v] of Object.entries(fields)) formData.append(k, v);
-
-                    const req1 = await fetch(configUrl, {
-                        method: 'POST',
-                        body: formData,
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
-                        redirect: 'follow',
-                        credentials: 'include',
-                    });
-                    const t2 = Date.now();
-                    if (!req1.ok) throw new Error(`加购请求异常 ${req1.status}`);
-                    logMsg(`加购成功 (${req1.status} · ${t2 - t1}ms)，发起结账`, 'ok');
-
-                    const checkoutData = new URLSearchParams();
-                    checkoutData.append('register_or_login', 'register');
-                    checkoutData.append('notes', '');
-                    checkoutData.append('payment', paymentMethod);
-                    checkoutData.append('terms', '1');
-                    checkoutData.append('promo', '');
-                    checkoutData.append('riskToken', '');
-
-                    const req2 = await fetch('/cart?action=viewcart&statuscart=checkout', {
-                        method: 'POST',
-                        body: checkoutData,
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
-                        redirect: 'follow',
-                        credentials: 'include',
-                    });
-                    const t3 = Date.now();
-                    if (!req2.ok) throw new Error(`结账请求异常 ${req2.status}`);
-
-                    const finalUrl = req2.url.toLowerCase();
-                    const isRealInvoice =
-                        finalUrl.includes('viewinvoice') ||
-                        finalUrl.includes('viewbilling') ||
-                        finalUrl.includes('invoice');
-
-                    if (!isRealInvoice) {
-                        const body2 = await req2.text().catch(() => '');
-                        const doc2 = new DOMParser().parseFromString(body2, 'text/html');
-                        const errEl = doc2.querySelector('.errorbox, .alert-danger, #statusmessage, .alert');
-                        const reason = errEl ? errEl.textContent.trim().slice(0, 100) : '未返回账单页';
-                        logMsg(`PID ${currentPid} 结账被拒：${reason}`, 'warn');
-                        continue;
-                    }
-
-                    logMsg(`PID ${currentPid} 锁单成功（总耗时 ${t3 - t0}ms），跳转账单页`, 'ok');
-                    stageEl.textContent = `PID ${currentPid} 已生成账单`;
-                    finishTask('已锁单', 'running');
-                    window.location.href = req2.url;
-                    grabbed = true;
+        try {
+            while (isRunning && !stopFlag) {
+                if (stopMs > 0 && serverNow() >= stopMs) {
+                    const msg = `已达停止时间 ${hostConfig.stopTime}，自动结束`;
+                    logMsg(msg, 'warn');
+                    stageEl.textContent = '已超时自动停止';
+                    finishTask('已超时停止', 'idle');
+                    triggerAlert('warn', `VPS Drop Sync · ${currentHost}`, msg);
                     return;
                 }
 
-                if (!grabbed && isRunning && !stopFlag) {
-                    logMsg(`第 ${attempt} 轮未命中，${speedMs}ms 后重试`, 'info');
-                }
-            } catch (err) {
-                logMsg(`请求异常：${err.message}，${speedMs}ms 后重试`, 'err');
-            }
+                try {
+                    let grabbed = false;
 
-            if (isRunning && !stopFlag) {
-                await new Promise((r) => setTimeout(r, speedMs));
-                attempt++;
+                    for (const currentPid of pidList) {
+                        if (!isRunning || stopFlag) break;
+
+                        const t0 = Date.now();
+                        await fetch('/cart?action=emptycart', { method: 'GET', credentials: 'include' }).catch(() => {});
+
+                        const configUrl = `/cart?action=configureproduct&pid=${encodeURIComponent(currentPid)}`;
+                        logMsg(`[#${attempt}] 探测 PID ${currentPid}`, 'sync');
+
+                        const resp = await fetch(`${configUrl}&nocache=${Date.now()}`, {
+                            redirect: 'follow',
+                            credentials: 'include',
+                        });
+                        const html = await resp.text();
+                        const t1 = Date.now();
+
+                        if (isLoginRedirect(resp.url, html)) {
+                            const msg = '检测到站点跳转登录页，登录状态已失效，任务自动停止';
+                            logMsg(msg, 'err');
+                            stageEl.textContent = '登录状态失效';
+                            finishTask('异常停止', 'error');
+                            triggerAlert('error', `VPS Drop Sync · 登录失效 (${currentHost})`, msg);
+                            return;
+                        }
+
+                        if (isOutOfStockHtml(html)) {
+                            logMsg(`PID ${currentPid} 暂无库存 (${resp.status} · ${t1 - t0}ms)`, 'warn');
+                            continue;
+                        }
+
+                        const doc = new DOMParser().parseFromString(html, 'text/html');
+                        const form = doc.getElementById('frmConfigureProduct') || doc.querySelector('form');
+                        if (!form) {
+                            logMsg(`PID ${currentPid} 页面未检测到配置表单，跳过`, 'warn');
+                            continue;
+                        }
+
+                        const fields = extractFormFields(form, currentPid, {
+                            nowMs: Date.now(),
+                            fallbackPassword: generateFallbackPassword,
+                        });
+
+                        logMsg(`PID ${currentPid} 有货，提交加购 (${Object.keys(fields).length} 字段)`, 'ok');
+                        const formData = new URLSearchParams();
+                        for (const [k, v] of Object.entries(fields)) formData.append(k, v);
+
+                        const req1 = await fetch(configUrl, {
+                            method: 'POST',
+                            body: formData,
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+                            redirect: 'follow',
+                            credentials: 'include',
+                        });
+                        const t2 = Date.now();
+                        if (!req1.ok) throw new Error(`加购请求异常 ${req1.status}`);
+                        logMsg(`加购成功 (${req1.status} · ${t2 - t1}ms)，发起结账`, 'ok');
+
+                        const checkoutData = buildCheckoutPayload({
+                            paymentMethod: hostConfig.paymentMethod,
+                            promoCode: hostConfig.promoCode,
+                        });
+
+                        const req2 = await fetch('/cart?action=viewcart&statuscart=checkout', {
+                            method: 'POST',
+                            body: checkoutData,
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+                            redirect: 'follow',
+                            credentials: 'include',
+                        });
+                        const t3 = Date.now();
+                        if (!req2.ok) throw new Error(`结账请求异常 ${req2.status}`);
+
+                        if (!isInvoiceUrl(req2.url)) {
+                            const body2 = await req2.text().catch(() => '');
+                            if (isLoginRedirect(req2.url, body2)) {
+                                const msg = '结账阶段跳转登录页，登录状态已失效，任务自动停止';
+                                logMsg(msg, 'err');
+                                stageEl.textContent = '登录状态失效';
+                                finishTask('异常停止', 'error');
+                                triggerAlert('error', `VPS Drop Sync · 登录失效 (${currentHost})`, msg);
+                                return;
+                            }
+                            const doc2 = new DOMParser().parseFromString(body2, 'text/html');
+                            const errEl = doc2.querySelector('.errorbox, .alert-danger, #statusmessage, .alert');
+                            const reason = errEl ? errEl.textContent.trim().slice(0, 100) : '未返回账单页';
+                            logMsg(`PID ${currentPid} 结账被拒：${reason}`, 'warn');
+                            continue;
+                        }
+
+                        const totalCost = t3 - t0;
+                        const redirectDelayMs = hostConfig.soundMuted ? 300 : 1200;
+                        logMsg(`PID ${currentPid} 锁单成功（总耗时 ${totalCost}ms），即将跳转账单页`, 'ok');
+                        stageEl.textContent = `PID ${currentPid} 已生成账单`;
+                        finishTask('已锁单', 'running');
+                        triggerAlert(
+                            'success',
+                            `VPS Drop Sync · 锁单成功 (${currentHost})`,
+                            `PID ${currentPid} 已生成账单（总耗时 ${totalCost}ms），请尽快完成支付！`
+                        );
+                        redirectTimer = setTimeout(() => {
+                            window.location.href = req2.url;
+                        }, redirectDelayMs);
+                        grabbed = true;
+                        return;
+                    }
+
+                    if (!grabbed && isRunning && !stopFlag) {
+                        logMsg(`第 ${attempt} 轮未命中，${hostConfig.speedMs}ms 后重试`, 'info');
+                    }
+                } catch (err) {
+                    logMsg(`请求异常：${err.message}，${hostConfig.speedMs}ms 后重试`, 'err');
+                }
+
+                if (isRunning && !stopFlag) {
+                    await new Promise((r) => setTimeout(r, hostConfig.speedMs));
+                    attempt++;
+                }
             }
+        } catch (fatalErr) {
+            const msg = `抢购任务因未预期异常中断：${fatalErr?.message || fatalErr}`;
+            logMsg(msg, 'err');
+            stageEl.textContent = '异常停止';
+            finishTask('异常停止', 'error');
+            triggerAlert('error', `VPS Drop Sync · 异常停止 (${currentHost})`, msg);
         }
     }
 })();
