@@ -1,3 +1,5 @@
+简体中文 | [English](README.en.md)
+
 # VPS Drop Sync
 
 通用 VPS 放货精准对时与自动抢购助手。
@@ -35,7 +37,7 @@ VPS Drop Sync 是一个 Tampermonkey 用户脚本，适用于采用相同购物�
 - 可设置自动开始和自动停止时间。
 - 支持 500ms、100ms 和 10ms 三档重试频率。
 - Wake Lock 防止等待过程中设备休眠。
-- 跨页面保存最近 100 条运行日志。
+- 跨页面（同标签页 `sessionStorage`）保存最近 100 条运行日志。
 - 成功后自动跳转到账单或支付页面。
 
 ## 配置服务商网址
@@ -48,7 +50,7 @@ VPS Drop Sync 是一个 Tampermonkey 用户脚本，适用于采用相同购物�
 4. 在脚本菜单中选择“在当前网站启用 VPS Drop Sync”。
 5. 刷新网页，右上角会出现控制面板。
 
-脚本按完整主机名保存白名单。例如，在 panel.example.com 上启用，并不会自动在 www.example.com 上启用。如果服务商的商品页和结账页位于不同子域名，需要分别启用。
+脚本按完整主机地址（`location.host`，含非默认端口）保存白名单。例如，在 `panel.example.com` 上启用，并不会自动在 `www.example.com` 上启用。如果服务商的商品页和结账页位于不同子域名，需要分别启用。
 
 需要停用时，在对应网站的 Tampermonkey 菜单中选择“在当前网站禁用 VPS Drop Sync”。
 
@@ -159,7 +161,3 @@ https://panel.example.com/cart?action=configureproduct&pid=2161
 ## License
 
 [MIT](LICENSE)
-
----
-
-English summary: A generic Tampermonkey assistant for time-synchronized VPS restock ordering on compatible cart systems. It supports two-stage server clock calibration, multi-PID polling, dynamic form parsing, host allowlisting, automatic checkout, and configurable retry intervals.
