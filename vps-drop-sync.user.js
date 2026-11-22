@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         VPS Drop Sync V4.1（二段式精准对时版）
+// @name         VPS Drop Sync
 // @namespace    https://github.com/1Beyond1/VPS-Drop-Sync
-// @version      4.1.0
-// @description  通用 VPS 放货精准对时与自动抢购助手：二段式服务器校时、多 PID 轮询、动态表单解析和自动结账。
+// @version      4.2.0
+// @description  通用 VPS 放货精准对时与自动抢购助手：二段式服务器校时、多 PID 轮询、动态表单解析与自动结账。
 // @author       1Beyond1
 // @license      MIT
 // @homepageURL  https://github.com/1Beyond1/VPS-Drop-Sync
@@ -21,44 +21,90 @@
 (function () {
     'use strict';
 
-    // ============================================
-    // 基础设置与时间格式处理
-    // ============================================
-    const toDateTimeLocalFormat = (timeStr) => {
-        if (!timeStr) return "";
-        // 支持秒级精度：slice 到8位包含秒 (yyyy-MM-ddTHH:mm:ss)
-        const s = timeStr.replace(' ', 'T');
-        return s.length >= 19 ? s.slice(0, 19) : s.slice(0, 16);
+    const VERSION = '4.2.0';
+    const ENABLED_HOSTS_KEY = 'vpsDropSyncEnabledHosts';
+    const LOG_STORAGE_KEY = 'vps_drop_sync_logs';
+    const MAX_LOGS = 100;
+
+    // --------------------------------------------
+    // 时间格式与存储工具
+    // --------------------------------------------
+    const toDateTimeLocal = (timeStr) => {
+        if (!timeStr) return '';
+        const normalized = timeStr.replace(' ', 'T');
+        return normalized.length >= 19 ? normalized.slice(0, 19) : normalized.slice(0, 16);
     };
 
-    const fromDateTimeLocalFormat = (dtStr) => {
-        if (!dtStr) return "";
-        // datetime-local 含秒时返回完整格式，不含秒时补上 :00
+    const fromDateTimeLocal = (dtStr) => {
+        if (!dtStr) return '';
         const base = dtStr.replace('T', ' ');
-        return base.length >= 19 ? base : base + ':00';
+        return base.length >= 19 ? base : `${base}:00`;
+    };
+
+    const formatCountdown = (remainMs) => {
+        const clamped = Math.max(0, remainMs);
+        const totalSec = Math.floor(clamped / 1000);
+        const hours = Math.floor(totalSec / 3600);
+        const mins = Math.floor((totalSec % 3600) / 60);
+        const secs = totalSec % 60;
+        const tenths = Math.floor((clamped % 1000) / 100);
+        const pad = (n) => String(n).padStart(2, '0');
+        return `${pad(hours)}:${pad(mins)}:${pad(secs)}.${tenths}`;
     };
 
     const storageRead = (key, defaultVal) => {
-        if (typeof GM_getValue === "function") return GM_getValue(key, defaultVal);
-        const v = localStorage.getItem("tm_" + key);
-        return v !== null ? v : defaultVal;
+        try {
+            if (typeof GM_getValue === 'function') return GM_getValue(key, defaultVal);
+            const v = localStorage.getItem(`tm_${key}`);
+            return v !== null ? v : defaultVal;
+        } catch {
+            return defaultVal;
+        }
     };
 
     const storageWrite = (key, val) => {
-        if (typeof GM_setValue === "function") GM_setValue(key, val);
-        else localStorage.setItem("tm_" + key, val);
+        try {
+            if (typeof GM_setValue === 'function') GM_setValue(key, val);
+            else localStorage.setItem(`tm_${key}`, String(val));
+        } catch {
+            // 隐私模式或存储受限时忽略持久化失败
+        }
     };
 
-    // ============================================
-    // 服务商域名白名单
-    // 脚本虽匹配所有网页，但未启用的站点只注册菜单，不注入面板、不发送请求。
-    // 在目标服务商页面打开 Tampermonkey 菜单即可启用或禁用当前网站。
-    // ============================================
-    const enabledHostsStorageKey = 'vpsDropSyncEnabledHosts';
+    const readSessionLogs = () => {
+        try {
+            const parsed = JSON.parse(sessionStorage.getItem(LOG_STORAGE_KEY) || '[]');
+            return Array.isArray(parsed) ? parsed : [];
+        } catch {
+            return [];
+        }
+    };
 
+    const writeSessionLogs = (logs) => {
+        try {
+            sessionStorage.setItem(LOG_STORAGE_KEY, JSON.stringify(logs));
+        } catch {
+            // 忽略 sessionStorage 写入限制
+        }
+    };
+
+    const generateFallbackPassword = () => {
+        const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$';
+        const bytes = new Uint8Array(14);
+        if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+            window.crypto.getRandomValues(bytes);
+        } else {
+            for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+        }
+        return Array.from(bytes, (b) => chars[b % chars.length]).join('');
+    };
+
+    // --------------------------------------------
+    // 站点域名白名单（按 location.host 隔离）
+    // --------------------------------------------
     function getEnabledHosts() {
         try {
-            const hosts = JSON.parse(storageRead(enabledHostsStorageKey, '[]'));
+            const hosts = JSON.parse(storageRead(ENABLED_HOSTS_KEY, '[]'));
             return Array.isArray(hosts) ? hosts : [];
         } catch {
             return [];
@@ -72,575 +118,834 @@
     if (typeof GM_registerMenuCommand === 'function') {
         GM_registerMenuCommand(
             isCurrentHostEnabled
-                ? `❌ 在当前网站禁用 VPS Drop Sync（${currentHost}）`
-                : `✅ 在当前网站启用 VPS Drop Sync（${currentHost}）`,
+                ? `在当前网站禁用 VPS Drop Sync（${currentHost}）`
+                : `在当前网站启用 VPS Drop Sync（${currentHost}）`,
             () => {
                 const nextHosts = isCurrentHostEnabled
-                    ? enabledHosts.filter(host => host !== currentHost)
+                    ? enabledHosts.filter((host) => host !== currentHost)
                     : [...new Set([...enabledHosts, currentHost])];
-                storageWrite(enabledHostsStorageKey, JSON.stringify(nextHosts));
+                storageWrite(ENABLED_HOSTS_KEY, JSON.stringify(nextHosts));
                 location.reload();
             }
         );
     }
 
-    if (!isCurrentHostEnabled) {
-        console.info(`[VPS Drop Sync] 当前网站尚未启用：${currentHost}`);
-        return;
-    }
+    if (!isCurrentHostEnabled) return;
 
-    let targetPid = storageRead('targetPid', '');
-    let startTime = storageRead('startTime', '');
-    let stopTime  = storageRead('stopTime',  ''); // 可选：自动停止时间
-    let paymentMethod = storageRead('paymentMethod', 'AliPayH5');
-    let speedMs = parseInt(storageRead('speedMs', '500'));
+    let targetPid = String(storageRead('targetPid', '') || '');
+    let startTime = String(storageRead('startTime', '') || '');
+    let stopTime = String(storageRead('stopTime', '') || '');
+    let paymentMethod = String(storageRead('paymentMethod', 'AliPayH5') || 'AliPayH5');
+    let speedMs = parseInt(storageRead('speedMs', '500'), 10);
+    if (![500, 100, 10].includes(speedMs)) speedMs = 500;
 
-    // ============================================
-    // 构建图形化控制面板
-    // ============================================
-    const panel = document.createElement('div');
-    panel.style.cssText = 'position:fixed; top:20px; right:20px; z-index:999999; background:rgba(0, 0, 0, 0.9); color:#eee; padding:15px; border-radius:10px; font-family:"微软雅黑", "Consolas", sans-serif; font-size:13px; min-width:320px; box-shadow:0 10px 30px rgba(0,0,0,0.8); border:1px solid #444; backdrop-filter:blur(5px); transition:all 0.3s ease;';
+    // --------------------------------------------
+    // 构建 Shadow DOM 悬浮控制面板
+    // --------------------------------------------
+    const hostEl = document.createElement('div');
+    hostEl.id = 'vps-drop-sync-host';
+    hostEl.style.cssText = 'position:fixed; top:20px; right:20px; z-index:2147483646;';
+    const shadow = hostEl.attachShadow({ mode: 'open' });
 
-    panel.innerHTML = `
+    shadow.innerHTML = `
         <style>
-            .tm-input { width:100%; box-sizing:border-box; padding:6px; background:#111; border:1px solid #444; color:#0f0; border-radius:4px; font-family:monospace; outline:none; }
-            .tm-input:focus { border-color: #2196F3; }
-            input[type="datetime-local"] { color-scheme: dark; font-size: 12px; }
-            .tm-label { display:block; margin-bottom:4px; color:#aaa; font-size:12px; }
-            .tm-btn { flex:1; padding:10px; color:#fff; border:none; cursor:pointer; font-weight:bold; border-radius:6px; box-shadow:0 4px 6px rgba(0,0,0,0.3); transition:all 0.2s; }
-            .tm-log { margin-top:10px; background:#000; padding:8px; border:1px solid #333; border-radius:4px; height:150px; overflow-y:auto; font-family:monospace; font-size:11px; color:#0f0; line-height:1.4; white-space:pre-wrap; }
+            :host {
+                all: initial;
+                font-family: "Inter", "PingFang SC", "Microsoft YaHei UI", -apple-system, BlinkMacSystemFont, sans-serif;
+                color-scheme: dark;
+            }
+            * { box-sizing: border-box; }
+            .vds-card {
+                width: 356px;
+                background: rgba(13, 17, 24, 0.94);
+                color: #e6edf3;
+                border: 1px solid rgba(148, 163, 184, 0.22);
+                border-radius: 14px;
+                box-shadow: 0 20px 50px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+                backdrop-filter: blur(16px);
+                -webkit-backdrop-filter: blur(16px);
+                overflow: hidden;
+                font-size: 12.5px;
+                line-height: 1.45;
+                user-select: none;
+            }
+            .vds-card.collapsed { width: auto; min-width: 224px; }
+            .vds-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                padding: 11px 14px;
+                background: linear-gradient(180deg, rgba(30, 41, 59, 0.65), rgba(15, 23, 42, 0.35));
+                border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+                cursor: grab;
+            }
+            .vds-header:active { cursor: grabbing; }
+            .vds-card.collapsed .vds-header { border-bottom: none; }
+            .vds-title-wrap { display: flex; align-items: center; gap: 8px; min-width: 0; }
+            .vds-dot {
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background: #64748b;
+                flex-shrink: 0;
+                transition: background 0.2s, box-shadow 0.2s;
+            }
+            .vds-dot.idle { background: #64748b; }
+            .vds-dot.syncing { background: #38bdf8; box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.22); }
+            .vds-dot.armed { background: #f59e0b; box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.22); }
+            .vds-dot.running { background: #22c55e; box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.25); }
+            .vds-dot.error { background: #ef4444; box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.22); }
+            .vds-title { font-size: 13px; font-weight: 600; letter-spacing: 0.01em; color: #f8fafc; white-space: nowrap; }
+            .vds-badge {
+                font-size: 10.5px;
+                font-weight: 500;
+                padding: 1px 6px;
+                border-radius: 999px;
+                background: rgba(56, 189, 248, 0.14);
+                color: #7dd3fc;
+                border: 1px solid rgba(56, 189, 248, 0.28);
+                font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+            }
+            .vds-toggle {
+                background: rgba(148, 163, 184, 0.12);
+                border: 1px solid rgba(148, 163, 184, 0.2);
+                color: #cbd5e1;
+                border-radius: 6px;
+                padding: 3px 8px;
+                font-size: 11px;
+                cursor: pointer;
+                transition: background 0.15s, color 0.15s;
+            }
+            .vds-toggle:hover { background: rgba(148, 163, 184, 0.22); color: #fff; }
+            .vds-body { padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 11px; }
+            .vds-card.collapsed .vds-body { display: none; }
+
+            .vds-telemetry {
+                display: grid;
+                grid-template-columns: 1.3fr 1fr 0.85fr;
+                gap: 6px;
+            }
+            .vds-metric {
+                background: rgba(30, 41, 59, 0.48);
+                border: 1px solid rgba(148, 163, 184, 0.14);
+                border-radius: 8px;
+                padding: 6px 8px;
+                min-width: 0;
+            }
+            .vds-metric-k { font-size: 10px; color: #94a3b8; margin-bottom: 2px; }
+            .vds-metric-v {
+                font-size: 12px;
+                font-weight: 600;
+                color: #f1f5f9;
+                font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+                font-variant-numeric: tabular-nums;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .vds-countdown {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 8px 11px;
+                border-radius: 9px;
+                background: linear-gradient(90deg, rgba(14, 165, 233, 0.12), rgba(30, 41, 59, 0.45));
+                border: 1px solid rgba(56, 189, 248, 0.24);
+            }
+            .vds-countdown-label { font-size: 11px; color: #94a3b8; }
+            .vds-countdown-stage { font-size: 10.5px; color: #7dd3fc; margin-top: 1px; }
+            .vds-countdown-val {
+                font-size: 20px;
+                font-weight: 700;
+                letter-spacing: 0.03em;
+                color: #f8fafc;
+                font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+                font-variant-numeric: tabular-nums;
+            }
+            .vds-countdown.sprint {
+                background: linear-gradient(90deg, rgba(245, 158, 11, 0.18), rgba(30, 41, 59, 0.5));
+                border-color: rgba(245, 158, 11, 0.42);
+            }
+            .vds-countdown.sprint .vds-countdown-val { color: #fde047; }
+
+            .vds-form { display: flex; flex-direction: column; gap: 8px; }
+            .vds-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+            .vds-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+            .vds-label { font-size: 11px; color: #94a3b8; display: flex; justify-content: space-between; }
+            .vds-hint { color: #64748b; font-size: 10.5px; }
+            .vds-input, .vds-select {
+                width: 100%;
+                height: 31px;
+                padding: 0 9px;
+                background: rgba(15, 23, 42, 0.85);
+                border: 1px solid rgba(148, 163, 184, 0.22);
+                border-radius: 7px;
+                color: #f8fafc;
+                font-size: 12px;
+                font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+                outline: none;
+                transition: border-color 0.15s, box-shadow 0.15s;
+            }
+            .vds-select { font-family: inherit; }
+            .vds-input:focus, .vds-select:focus {
+                border-color: #38bdf8;
+                box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
+            }
+            .vds-input:disabled, .vds-select:disabled { opacity: 0.55; cursor: not-allowed; }
+            .vds-alert {
+                display: none;
+                padding: 7px 9px;
+                border-radius: 7px;
+                font-size: 11.5px;
+                background: rgba(239, 68, 68, 0.14);
+                border: 1px solid rgba(239, 68, 68, 0.35);
+                color: #fca5a5;
+            }
+            .vds-alert.show { display: block; }
+
+            .vds-actions { display: flex; gap: 8px; }
+            .vds-btn {
+                flex: 1;
+                height: 35px;
+                border: none;
+                border-radius: 8px;
+                font-size: 12.5px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: transform 0.1s, filter 0.15s, opacity 0.15s;
+            }
+            .vds-btn:active { transform: translateY(1px); }
+            .vds-btn-primary {
+                background: linear-gradient(135deg, #0284c7, #2563eb);
+                color: #fff;
+                box-shadow: 0 6px 18px rgba(37, 99, 235, 0.32);
+            }
+            .vds-btn-primary:hover { filter: brightness(1.08); }
+            .vds-btn-danger {
+                background: linear-gradient(135deg, #dc2626, #b91c1c);
+                color: #fff;
+                box-shadow: 0 6px 18px rgba(220, 38, 38, 0.28);
+                display: none;
+            }
+            .vds-btn-danger:hover { filter: brightness(1.08); }
+
+            .vds-log-section {
+                border-top: 1px solid rgba(148, 163, 184, 0.14);
+                padding-top: 9px;
+            }
+            .vds-log-head {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                margin-bottom: 6px;
+                font-size: 11px;
+                color: #94a3b8;
+            }
+            .vds-clear {
+                background: none;
+                border: none;
+                color: #94a3b8;
+                font-size: 11px;
+                cursor: pointer;
+                padding: 1px 4px;
+                border-radius: 4px;
+            }
+            .vds-clear:hover { color: #f87171; background: rgba(239, 68, 68, 0.12); }
+            .vds-log {
+                background: rgba(2, 6, 23, 0.72);
+                border: 1px solid rgba(148, 163, 184, 0.14);
+                border-radius: 8px;
+                height: 132px;
+                overflow-y: auto;
+                padding: 7px 9px;
+                font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+                font-size: 11px;
+                line-height: 1.5;
+                user-select: text;
+            }
+            .vds-log-line { display: flex; gap: 6px; margin-bottom: 2px; word-break: break-all; }
+            .vds-log-ts { color: #64748b; flex-shrink: 0; }
+            .vds-log-line.info .vds-log-msg { color: #cbd5e1; }
+            .vds-log-line.sync .vds-log-msg { color: #7dd3fc; }
+            .vds-log-line.ok .vds-log-msg { color: #4ade80; }
+            .vds-log-line.warn .vds-log-msg { color: #fbbf24; }
+            .vds-log-line.err .vds-log-msg { color: #f87171; }
         </style>
-        <h3 style="color:#2196F3; margin:0 0 10px 0; padding-bottom:10px; border-bottom:1px solid #333; font-size:16px; font-weight:bold; display:flex; justify-content:space-between; align-items:center;">
-            <span>🕐 VPS Drop Sync V4.1｜二段式精准对时</span>
-            <span id="tm-toggle" style="cursor:pointer; font-size:12px; color:#888;">[隐藏面板]</span>
-        </h3>
 
-        <div id="tm-body" style="display:block;">
-            <div style="background:#222; padding:10px; border-radius:6px; margin-bottom:12px;">
-                <div style="margin-bottom:8px; font-size:14px;">🎯 状态: <strong id="tm-status" style="color:#FFA500;">未启动 (待命)</strong></div>
+        <section class="vds-card" id="vds-card">
+            <header class="vds-header" id="vds-drag">
+                <div class="vds-title-wrap">
+                    <span class="vds-dot idle" id="vds-dot"></span>
+                    <span class="vds-title">VPS Drop Sync</span>
+                    <span class="vds-badge">v${VERSION}</span>
+                </div>
+                <button type="button" class="vds-toggle" id="vds-toggle">收起</button>
+            </header>
 
-                <div style="margin-bottom:12px;">
-                    <label class="tm-label">多目标真实 PID (用逗号隔开):</label>
-                    <input type="text" id="tm-pid" value="${targetPid}" class="tm-input">
+            <div class="vds-body">
+                <div class="vds-telemetry">
+                    <div class="vds-metric">
+                        <div class="vds-metric-k">当前状态</div>
+                        <div class="vds-metric-v" id="vds-status">待命</div>
+                    </div>
+                    <div class="vds-metric">
+                        <div class="vds-metric-k">时钟偏差</div>
+                        <div class="vds-metric-v" id="vds-delta">--</div>
+                    </div>
+                    <div class="vds-metric">
+                        <div class="vds-metric-k">均值 RTT</div>
+                        <div class="vds-metric-v" id="vds-rtt">--</div>
+                    </div>
                 </div>
 
-                <div style="margin-bottom:12px;">
-                    <label class="tm-label">✅ 自动开抢时间 (精确到秒):</label>
-                    <input type="datetime-local" id="tm-time" step="1" value="${toDateTimeLocalFormat(startTime)}" class="tm-input">
+                <div class="vds-countdown" id="vds-countdown-box">
+                    <div>
+                        <div class="vds-countdown-label">距目标开抢</div>
+                        <div class="vds-countdown-stage" id="vds-stage">等待启动校时</div>
+                    </div>
+                    <div class="vds-countdown-val" id="vds-countdown">--:--:--.-</div>
                 </div>
 
-                <div style="margin-bottom:12px;">
-                    <label class="tm-label">🛑 自动停止时间 (超时后停止):</label>
-                    <input type="datetime-local" id="tm-stoptime" step="1" value="${toDateTimeLocalFormat(stopTime)}" class="tm-input">
+                <div class="vds-form">
+                    <div class="vds-field">
+                        <label class="vds-label" for="vds-pid">
+                            <span>目标商品 PID</span>
+                            <span class="vds-hint">多个用逗号分隔</span>
+                        </label>
+                        <input type="text" id="vds-pid" class="vds-input" placeholder="例如：2159, 2160">
+                    </div>
+
+                    <div class="vds-field">
+                        <label class="vds-label" for="vds-time">
+                            <span>开抢时间</span>
+                            <span class="vds-hint">精确到秒</span>
+                        </label>
+                        <input type="datetime-local" id="vds-time" step="1" class="vds-input">
+                    </div>
+
+                    <div class="vds-field">
+                        <label class="vds-label" for="vds-stoptime">
+                            <span>自动停止时间</span>
+                            <span class="vds-hint">可选，避免持续请求</span>
+                        </label>
+                        <input type="datetime-local" id="vds-stoptime" step="1" class="vds-input">
+                    </div>
+
+                    <div class="vds-row">
+                        <div class="vds-field">
+                            <label class="vds-label" for="vds-pay">付款方式</label>
+                            <select id="vds-pay" class="vds-select">
+                                <option value="AliPayH5">支付宝 (AliPayH5)</option>
+                                <option value="wechatpay">微信支付</option>
+                                <option value="paypal">PayPal</option>
+                            </select>
+                        </div>
+                        <div class="vds-field">
+                            <label class="vds-label" for="vds-speed">重试频率</label>
+                            <select id="vds-speed" class="vds-select">
+                                <option value="500">安全 (500ms)</option>
+                                <option value="100">快速 (100ms)</option>
+                                <option value="10">极限 (10ms)</option>
+                            </select>
+                        </div>
+                    </div>
                 </div>
 
-                <div style="margin-bottom:8px;">
-                    <label class="tm-label">结算付款方式:</label>
-                    <select id="tm-pay" class="tm-input" style="color:#fff;">
-                        <option value="AliPayH5" ${paymentMethod === 'AliPayH5' ? 'selected' : ''}>支付宝 (AliPayH5)</option>
-                        <option value="wechatpay" ${paymentMethod === 'wechatpay' ? 'selected' : ''}>微信支付</option>
-                        <option value="paypal" ${paymentMethod === 'paypal' ? 'selected' : ''}>PayPal</option>
-                    </select>
+                <div class="vds-alert" id="vds-alert" role="alert"></div>
+
+                <div class="vds-actions">
+                    <button type="button" id="vds-start" class="vds-btn vds-btn-primary">启动定时抢购</button>
+                    <button type="button" id="vds-stop" class="vds-btn vds-btn-danger">停止任务</button>
                 </div>
 
-                <div style="margin-bottom:8px;">
-                    <label class="tm-label">请求重试频率 (请遵守服务商限流规则):</label>
-                    <select id="tm-speed" class="tm-input" style="color:#fff;">
-                        <option value="500" ${speedMs === 500 ? 'selected' : ''}>安全模式 (500ms 重试)</option>
-                        <option value="100" ${speedMs === 100 ? 'selected' : ''}>快速模式 (100ms 重试)</option>
-                        <option value="10" ${speedMs === 10 ? 'selected' : ''}>极限模式 (10ms 重试，封禁风险高)</option>
-                    </select>
+                <div class="vds-log-section">
+                    <div class="vds-log-head">
+                        <span id="vds-host-label">运行日志</span>
+                        <button type="button" class="vds-clear" id="vds-clear">清空</button>
+                    </div>
+                    <div class="vds-log" id="vds-log"></div>
                 </div>
             </div>
-
-            <div style="display:flex; justify-content:space-between; gap:10px;">
-                <button id="tm-start" class="tm-btn" style="background:linear-gradient(135deg, #4CAF50, #2E7D32);">
-                    ▶️ 启动定时 / 立即抢购
-                </button>
-                <button id="tm-stop" class="tm-btn" style="background:linear-gradient(135deg, #F44336, #C62828); display:none;">
-                    🛑 紧急停止
-                </button>
-            </div>
-
-            <div style="margin-top:12px; border-top:1px solid #333; padding-top:10px;">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
-                    <span style="color:#888; font-size:11px;">📋 运行日志 (跨页保存):</span>
-                    <span id="tm-clear-log" style="cursor:pointer; color:#F44336; font-size:11px;">[清空日志]</span>
-                </div>
-                <div id="tm-log" class="tm-log"></div>
-            </div>
-        </div>
+        </section>
     `;
-    document.body.appendChild(panel);
+    document.body.appendChild(hostEl);
 
-    // ============================================
-    // 逻辑控制与 DOM 绑定
-    // ============================================
-    const statusEl = document.getElementById('tm-status');
-    const startBtn = document.getElementById('tm-start');
-    const stopBtn = document.getElementById('tm-stop');
-    const bodyEl = document.getElementById('tm-body');
-    const toggleEl = document.getElementById('tm-toggle');
-    const logEl = document.getElementById('tm-log');
-    const clearLogBtn = document.getElementById('tm-clear-log');
+    // --------------------------------------------
+    // DOM 引用与初始值安全回填（不走 innerHTML 插值）
+    // --------------------------------------------
+    const $ = (id) => shadow.getElementById(id);
+    const cardEl = $('vds-card');
+    const dragEl = $('vds-drag');
+    const toggleBtn = $('vds-toggle');
+    const dotEl = $('vds-dot');
+    const statusEl = $('vds-status');
+    const deltaEl = $('vds-delta');
+    const rttEl = $('vds-rtt');
+    const countdownBox = $('vds-countdown-box');
+    const countdownEl = $('vds-countdown');
+    const stageEl = $('vds-stage');
+    const pidInput = $('vds-pid');
+    const timeInput = $('vds-time');
+    const stopTimeInput = $('vds-stoptime');
+    const paySelect = $('vds-pay');
+    const speedSelect = $('vds-speed');
+    const alertEl = $('vds-alert');
+    const startBtn = $('vds-start');
+    const stopBtn = $('vds-stop');
+    const logEl = $('vds-log');
+    const clearBtn = $('vds-clear');
+    const hostLabelEl = $('vds-host-label');
 
+    hostLabelEl.textContent = `运行日志 · ${currentHost}`;
+    pidInput.value = targetPid;
+    timeInput.value = toDateTimeLocal(startTime);
+    stopTimeInput.value = toDateTimeLocal(stopTime);
+    paySelect.value = paymentMethod;
+    speedSelect.value = String(speedMs);
+
+    // --------------------------------------------
+    // 面板折叠与拖拽定位
+    // --------------------------------------------
+    toggleBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const collapsed = cardEl.classList.toggle('collapsed');
+        toggleBtn.textContent = collapsed ? '展开' : '收起';
+    });
+
+    let dragState = null;
+    dragEl.addEventListener('pointerdown', (e) => {
+        if (e.target === toggleBtn) return;
+        const rect = hostEl.getBoundingClientRect();
+        dragState = { offsetX: e.clientX - rect.left, offsetY: e.clientY - rect.top };
+        dragEl.setPointerCapture(e.pointerId);
+    });
+    dragEl.addEventListener('pointermove', (e) => {
+        if (!dragState) return;
+        const maxX = Math.max(8, window.innerWidth - hostEl.offsetWidth - 8);
+        const maxY = Math.max(8, window.innerHeight - hostEl.offsetHeight - 8);
+        const nextX = Math.min(maxX, Math.max(8, e.clientX - dragState.offsetX));
+        const nextY = Math.min(maxY, Math.max(8, e.clientY - dragState.offsetY));
+        hostEl.style.left = `${nextX}px`;
+        hostEl.style.top = `${nextY}px`;
+        hostEl.style.right = 'auto';
+    });
+    dragEl.addEventListener('pointerup', () => { dragState = null; });
+    dragEl.addEventListener('pointercancel', () => { dragState = null; });
+
+    // --------------------------------------------
+    // 状态、日志与 Wake Lock 管理
+    // --------------------------------------------
     let isRunning = false;
     let stopFlag = false;
     let timeChecker = null;
+    let preSyncTimer = null;
+    let precisionTimer = null;
     let wakeLock = null;
-
-    async function acquireWakeLock() {
-        if (!('wakeLock' in navigator)) {
-            logMsg("⚠️ 浏览器不支持 Wake Lock（升级Chrome/Edge 93+）", "#FF9800");
-            return;
-        }
-        try {
-            wakeLock = await navigator.wakeLock.request('screen');
-            logMsg("☀️ 防休眠已激活，系统不会进入睡眠", "#4CAF50");
-            // 标签页重新可见时重新锁定（系统切回来后自动续期）
-            if (!window._tmWakeLockListenerAdded) {
-                window._tmWakeLockListenerAdded = true;
-                document.addEventListener('visibilitychange', async () => {
-                    if (wakeLock !== null && document.visibilityState === 'visible' && isRunning) {
-                        wakeLock = await navigator.wakeLock.request('screen').catch(() => null);
-                    }
-                });
-            }
-        } catch (e) {
-            logMsg(`⚠️ Wake Lock 申请失败: ${e.message}`, "#FF9800");
-        }
-    }
-
-    function releaseWakeLock() {
-        if (wakeLock) {
-            wakeLock.release();
-            wakeLock = null;
-            logMsg("🌙 防休眠已释放", "#888");
-        }
-    }
-
-    toggleEl.onclick = () => {
-        if (bodyEl.style.display === 'none') {
-            bodyEl.style.display = 'block';
-            toggleEl.innerText = "[隐藏面板]";
-        } else {
-            bodyEl.style.display = 'none';
-            toggleEl.innerText = "[展开配置面板]";
-        }
-    };
-
-    function logMsg(msg, color = "#FFA500") {
-        const timeStr = new Date().toLocaleTimeString();
-        const fullMsg = `[${timeStr}] ${msg}`;
-        console.log("[VPS Drop Sync V4.1]", msg);
-        statusEl.innerText = msg;
-        statusEl.style.color = color;
-
-        // 写入 UI 日志区
-        const logLine = document.createElement('div');
-        logLine.style.color = color;
-        logLine.innerText = fullMsg;
-        logEl.appendChild(logLine);
-        logEl.scrollTop = logEl.scrollHeight;
-
-        // 存入 sessionStorage (防止跳转丢日志)
-        let logs = JSON.parse(sessionStorage.getItem('vps_drop_sync_logs') || '[]');
-        logs.push({ text: fullMsg, color: color });
-        if (logs.length > 100) logs.shift(); // 最多存100条
-        sessionStorage.setItem('vps_drop_sync_logs', JSON.stringify(logs));
-    }
-
-    // 初始化加载日志
-    const savedLogs = JSON.parse(sessionStorage.getItem('vps_drop_sync_logs') || '[]');
-    savedLogs.forEach(l => {
-        const line = document.createElement('div');
-        line.style.color = l.color;
-        line.innerText = l.text;
-        logEl.appendChild(line);
-    });
-    logEl.scrollTop = logEl.scrollHeight;
-
-    clearLogBtn.onclick = () => {
-        sessionStorage.removeItem('vps_drop_sync_logs');
-        logEl.innerHTML = '';
-    };
-
-    // ============================================
-    // 服务器时钟校准 (V4.1: 多次采样取均值)
-    // ============================================
-    // 取5次 HEAD 请求的 NTP 中点，丢弃最大/最小 RTT，剩余3次取均值，大幅降低抖动
     let serverTimeDelta = 0;
 
     function serverNow() {
         return Date.now() + serverTimeDelta;
     }
 
-    async function syncServerTime(label = '初始校时', samples = 5) {
-        logMsg(`🕐 [${label}] 开始 ${samples} 次采样校准时钟...`, "#888");
-        const deltas = [];
-        const rtts   = [];
+    function setAlert(msg) {
+        if (!msg) {
+            alertEl.textContent = '';
+            alertEl.classList.remove('show');
+            return;
+        }
+        alertEl.textContent = msg;
+        alertEl.classList.add('show');
+    }
 
+    function setStatus(text, tone = 'idle') {
+        statusEl.textContent = text;
+        dotEl.className = `vds-dot ${tone}`;
+    }
+
+    function appendLogDom(ts, text, level = 'info') {
+        const row = document.createElement('div');
+        row.className = `vds-log-line ${level}`;
+        const tsSpan = document.createElement('span');
+        tsSpan.className = 'vds-log-ts';
+        tsSpan.textContent = ts;
+        const msgSpan = document.createElement('span');
+        msgSpan.className = 'vds-log-msg';
+        msgSpan.textContent = text;
+        row.appendChild(tsSpan);
+        row.appendChild(msgSpan);
+        logEl.appendChild(row);
+        logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function logMsg(msg, level = 'info') {
+        const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+        appendLogDom(ts, msg, level);
+        const logs = readSessionLogs();
+        logs.push({ ts, text: msg, level });
+        while (logs.length > MAX_LOGS) logs.shift();
+        writeSessionLogs(logs);
+    }
+
+    readSessionLogs().forEach((entry) => {
+        if (entry && typeof entry.text === 'string') {
+            appendLogDom(entry.ts || '--:--:--', entry.text, entry.level || 'info');
+        }
+    });
+
+    clearBtn.addEventListener('click', () => {
+        try { sessionStorage.removeItem(LOG_STORAGE_KEY); } catch {}
+        logEl.textContent = '';
+    });
+
+    function clearAllTimers() {
+        if (timeChecker) { clearInterval(timeChecker); timeChecker = null; }
+        if (preSyncTimer) { clearTimeout(preSyncTimer); preSyncTimer = null; }
+        if (precisionTimer) { clearTimeout(precisionTimer); precisionTimer = null; }
+    }
+
+    function setControlsDisabled(disabled) {
+        pidInput.disabled = disabled;
+        timeInput.disabled = disabled;
+        stopTimeInput.disabled = disabled;
+        paySelect.disabled = disabled;
+        speedSelect.disabled = disabled;
+        startBtn.style.display = disabled ? 'none' : 'block';
+        stopBtn.style.display = disabled ? 'block' : 'none';
+    }
+
+    async function acquireWakeLock() {
+        if (!('wakeLock' in navigator)) {
+            logMsg('浏览器不支持 Wake Lock，请手动保持屏幕常亮', 'warn');
+            return;
+        }
+        try {
+            wakeLock = await navigator.wakeLock.request('screen');
+            logMsg('防休眠锁已激活', 'ok');
+            if (!window._vdsWakeLockBound) {
+                window._vdsWakeLockBound = true;
+                document.addEventListener('visibilitychange', async () => {
+                    if (document.visibilityState === 'visible' && isRunning && !stopFlag) {
+                        wakeLock = await navigator.wakeLock.request('screen').catch(() => null);
+                    }
+                });
+            }
+        } catch (err) {
+            logMsg(`防休眠申请失败：${err.message}`, 'warn');
+        }
+    }
+
+    function releaseWakeLock() {
+        if (!wakeLock) return;
+        wakeLock.release().catch(() => {});
+        wakeLock = null;
+    }
+
+    // --------------------------------------------
+    // 二段式服务器时钟校准（RTT 去极值均值）
+    // --------------------------------------------
+    async function syncServerTime(label = '校时', samples = 5) {
+        setStatus('校时中', 'syncing');
+        stageEl.textContent = `${label}（${samples} 次采样）`;
+        logMsg(`${label}开始，采样 ${samples} 次`, 'sync');
+
+        const pairs = [];
         for (let i = 0; i < samples; i++) {
+            if (stopFlag) return;
             try {
                 const t0 = Date.now();
-                const r  = await fetch('/', { method: 'HEAD', credentials: 'include', cache: 'no-store' });
+                const resp = await fetch('/', { method: 'HEAD', credentials: 'include', cache: 'no-store' });
                 const t1 = Date.now();
-                const serverDateStr = r.headers.get('Date');
-                if (!serverDateStr) continue;
-                const rtt = t1 - t0;
-                const serverMs = new Date(serverDateStr).getTime();
-                const midpoint = (t0 + t1) / 2;
-                deltas.push(serverMs - midpoint);
-                rtts.push(rtt);
-                // 采样间隔 200ms，避免连发请求
-                if (i < samples - 1) await new Promise(r => setTimeout(r, 200));
-            } catch (e) {
-                console.warn('[VPS Drop Sync V4.1] 采样失败:', e);
+                const dateHeader = resp.headers.get('Date');
+                if (dateHeader) {
+                    const serverMs = new Date(dateHeader).getTime();
+                    if (!Number.isNaN(serverMs)) {
+                        const rtt = t1 - t0;
+                        pairs.push({ delta: serverMs - (t0 + t1) / 2, rtt });
+                    }
+                }
+                if (i < samples - 1) await new Promise((r) => setTimeout(r, 200));
+            } catch {
+                // 单次采样失败继续后续样本
             }
         }
 
-        if (deltas.length === 0) {
-            logMsg(`⚠️ [${label}] 全部采样失败，使用本地时钟`, "#FF9800");
+        if (pairs.length === 0) {
+            deltaEl.textContent = '本地时钟';
+            rttEl.textContent = '--';
+            logMsg(`${label}采样失败，回退本地时钟`, 'warn');
             return;
         }
 
-        // 按 RTT 排序，丢掉最快和最慢的采样（异常值），剩余取均值
-        const paired = deltas.map((d, i) => ({ d, rtt: rtts[i] })).sort((a, b) => a.rtt - b.rtt);
-        const trimmed = paired.length > 2 ? paired.slice(1, -1) : paired; // 去掉两端
-        const avgDelta = Math.round(trimmed.reduce((sum, p) => sum + p.d, 0) / trimmed.length);
-        const avgRtt   = Math.round(trimmed.reduce((sum, p) => sum + p.rtt, 0) / trimmed.length);
+        pairs.sort((a, b) => a.rtt - b.rtt);
+        const trimmed = pairs.length > 2 ? pairs.slice(1, -1) : pairs;
+        const avgDelta = Math.round(trimmed.reduce((s, p) => s + p.delta, 0) / trimmed.length);
+        const avgRtt = Math.round(trimmed.reduce((s, p) => s + p.rtt, 0) / trimmed.length);
 
         serverTimeDelta = avgDelta;
-        logMsg(`✅ [${label}] 校准完成！偏差: ${avgDelta > 0 ? '+' : ''}${avgDelta}ms | 均值RTT: ${avgRtt}ms (有效样本: ${trimmed.length}/${samples})`, "#4CAF50");
-        console.log(`[VPS Drop Sync V4.1] ${label} serverTimeDelta =`, avgDelta, 'ms, avgRtt =', avgRtt, 'ms');
+        const sign = avgDelta > 0 ? '+' : '';
+        deltaEl.textContent = `${sign}${avgDelta}ms`;
+        rttEl.textContent = `${avgRtt}ms`;
+        logMsg(`${label}完成 · 偏差 ${sign}${avgDelta}ms · RTT ${avgRtt}ms (${pairs.length}/${samples})`, 'ok');
     }
 
-    stopBtn.onclick = () => {
-        stopFlag = true;
+    // --------------------------------------------
+    // 任务启停与倒计时调度
+    // --------------------------------------------
+    function finishTask(statusText, tone = 'idle') {
+        clearAllTimers();
         isRunning = false;
-        if (timeChecker) clearInterval(timeChecker);
+        stopFlag = true;
         releaseWakeLock();
-        logMsg("🛑 用户主动中止！", "#F44336");
+        setControlsDisabled(false);
+        countdownBox.classList.remove('sprint');
+        setStatus(statusText, tone);
+    }
 
-        startBtn.style.display = 'block';
-        stopBtn.style.display = 'none';
+    stopBtn.addEventListener('click', () => {
+        finishTask('已中止', 'error');
+        stageEl.textContent = '任务已手动停止';
+        countdownEl.textContent = '--:--:--.-';
+        logMsg('用户手动中止任务', 'err');
+    });
 
-        document.getElementById('tm-pid').disabled = false;
-        document.getElementById('tm-time').disabled = false;
-        document.getElementById('tm-stoptime').disabled = false;
-        document.getElementById('tm-pay').disabled = false;
-        document.getElementById('tm-speed').disabled = false;
-    };
-
-    startBtn.onclick = async () => {
-        targetPid = document.getElementById('tm-pid').value.trim();
-        startTime = fromDateTimeLocalFormat(document.getElementById('tm-time').value);
-        stopTime  = fromDateTimeLocalFormat(document.getElementById('tm-stoptime').value);
-        paymentMethod = document.getElementById('tm-pay').value;
-        speedMs = parseInt(document.getElementById('tm-speed').value);
+    startBtn.addEventListener('click', async () => {
+        setAlert('');
+        targetPid = pidInput.value.trim();
+        startTime = fromDateTimeLocal(timeInput.value);
+        stopTime = fromDateTimeLocal(stopTimeInput.value);
+        paymentMethod = paySelect.value;
+        speedMs = parseInt(speedSelect.value, 10) || 500;
 
         storageWrite('targetPid', targetPid);
         storageWrite('startTime', startTime);
-        storageWrite('stopTime',  stopTime);
+        storageWrite('stopTime', stopTime);
         storageWrite('paymentMethod', paymentMethod);
         storageWrite('speedMs', speedMs);
 
         const targetMs = new Date(startTime.replace(/-/g, '/')).getTime();
-
         if (!targetPid) {
-            alert("❌ 请至少填写一个商品 PID！");
+            setAlert('请先填写至少一个目标商品 PID');
+            pidInput.focus();
+            return;
+        }
+        if (!startTime || Number.isNaN(targetMs)) {
+            setAlert('请选择有效的开抢时间');
+            timeInput.focus();
             return;
         }
 
-        if (!startTime || isNaN(targetMs)) {
-            alert("❌ 请先选择有效的抢购时间！");
-            return;
-        }
-
-        document.getElementById('tm-pid').disabled = true;
-        document.getElementById('tm-time').disabled = true;
-        document.getElementById('tm-stoptime').disabled = true;
-        document.getElementById('tm-pay').disabled = true;
-        document.getElementById('tm-speed').disabled = true;
-
-        startBtn.style.display = 'none';
-        stopBtn.style.display = 'block';
-
+        clearAllTimers();
+        setControlsDisabled(true);
         isRunning = true;
         stopFlag = false;
 
-        acquireWakeLock(); // 防止系统休眠
+        acquireWakeLock();
         const stopMs = stopTime ? new Date(stopTime.replace(/-/g, '/')).getTime() : 0;
-        if (stopMs > 0) logMsg(`⏰ 将在 ${stopTime} 自动停止`, "#888");
-        logMsg(`🕐 正在与服务器校对时钟...`, "#0ff");
+        if (stopMs > 0) logMsg(`已设自动停止：${stopTime}`, 'info');
 
-        // 第一段：启动时立刻做一次快速单次校时（用于倒计时准确显示）
         await syncServerTime('启动初校', 3);
+        if (!isRunning || stopFlag) return;
 
-        const now = serverNow();
-        if (now >= targetMs) {
-            startRobbing();
-        } else {
-            // 第二段：在开抢前 60 秒，服务器还没承压时做精准多次采样
-            const preSyncMs = targetMs - 60000;
-            const preSyncDelay = preSyncMs - serverNow();
-            if (preSyncDelay > 1000) {
-                logMsg(`📡 将在开抢前 60 秒自动精准校时`, "#888");
-                setTimeout(async () => {
-                    if (!isRunning || stopFlag) return;
-                    await syncServerTime('开抢前精校', 5);
-                }, preSyncDelay);
-            }
-
-            let lastLogTime = 0; // 日志节流用
-
-            timeChecker = setInterval(() => {
-                const innerNow = serverNow();
-                if (innerNow >= targetMs) {
-                    clearInterval(timeChecker);
-                    startRobbing();
-                } else {
-                    const remainMs = targetMs - innerNow;
-                    const diff = Math.floor(remainMs / 1000);
-
-                    // 根据剩余时间决定日志频率
-                    let logIntervalMs;
-                    if (diff > 300) {
-                        logIntervalMs = 60000;  // >5分钟：每分钟一条
-                    } else if (diff > 60) {
-                        logIntervalMs = 30000;  // 1~5分钟：每30秒一条
-                    } else {
-                        logIntervalMs = 500;    // <1分钟：原频率
-                    }
-
-                    if (innerNow - lastLogTime >= logIntervalMs) {
-                        lastLogTime = innerNow;
-                        if (diff > 60) {
-                            logMsg(`🕐 挂机等待中... 约 ${Math.floor(diff / 60)} 分 ${diff % 60} 秒后开抢 (偏差:${serverTimeDelta > 0 ? '+' : ''}${serverTimeDelta}ms)`, "#0ff");
-                        } else {
-                            logMsg(`🚨 准备！倒数 ${(remainMs / 1000).toFixed(1)}s ⏱ ${remainMs}ms`, "#0ff");
-                        }
-                    }
-                }
-            }, 500);
-            logMsg(`已校正本机时钟，守护程序启动，等待开抢时间...`, "#0ff");
-
-            // 最后5秒拉高精度到 50ms
-            setTimeout(() => {
-                if (!isRunning || stopFlag) return;
-                const remaining = targetMs - serverNow();
-                if (remaining > 0 && remaining <= 5000) {
-                    clearInterval(timeChecker);
-                    timeChecker = setInterval(() => {
-                        const innerNow2 = serverNow();
-                        if (innerNow2 >= targetMs) {
-                            clearInterval(timeChecker);
-                            startRobbing();
-                        } else {
-                            const ms = targetMs - innerNow2;
-                            logMsg(`🔥 倒数 ${(ms/1000).toFixed(2)}s ⏱ ${ms}ms`, "#ff0");
-                        }
-                    }, 50);
-                }
-            }, Math.max(0, targetMs - serverNow() - 5200));
+        if (serverNow() >= targetMs) {
+            startPolling();
+            return;
         }
-    };
 
-    function startRobbing() {
-        if (stopFlag) return;
-        logMsg("🔥 时间到！自动抢购已启动！", "#ffeb3b");
+        setStatus('定时待命', 'armed');
+        const preSyncDelay = targetMs - 60000 - serverNow();
+        if (preSyncDelay > 1000) {
+            stageEl.textContent = '开抢前 60 秒自动精校';
+            logMsg('已预约开抢前 60 秒二次精校', 'info');
+            preSyncTimer = setTimeout(async () => {
+                if (!isRunning || stopFlag) return;
+                await syncServerTime('开抢前精校', 5);
+                if (isRunning && !stopFlag) {
+                    setStatus('即将开抢', 'armed');
+                    stageEl.textContent = '二次精校已完成';
+                }
+            }, preSyncDelay);
+        } else {
+            stageEl.textContent = '倒计时同步运行中';
+        }
+
+        let lastLogAt = 0;
+        const tick = (sprint) => {
+            const now = serverNow();
+            if (now >= targetMs) {
+                clearAllTimers();
+                countdownEl.textContent = '00:00:00.0';
+                startPolling();
+                return;
+            }
+            const remainMs = targetMs - now;
+            countdownEl.textContent = formatCountdown(remainMs);
+            if (sprint) {
+                countdownBox.classList.add('sprint');
+                stageEl.textContent = '最后 5 秒 · 50ms 高精度触发';
+            }
+            const remainSec = Math.floor(remainMs / 1000);
+            const interval = remainSec > 300 ? 60000 : remainSec > 60 ? 30000 : 15000;
+            if (!sprint && now - lastLogAt >= interval) {
+                lastLogAt = now;
+                logMsg(`倒计时 ${formatCountdown(remainMs)}（偏差 ${serverTimeDelta >= 0 ? '+' : ''}${serverTimeDelta}ms）`, 'sync');
+            }
+        };
+
+        tick(false);
+        timeChecker = setInterval(() => tick(false), 200);
+
+        const sprintDelay = Math.max(0, targetMs - serverNow() - 5200);
+        precisionTimer = setTimeout(() => {
+            if (!isRunning || stopFlag) return;
+            if (timeChecker) clearInterval(timeChecker);
+            timeChecker = setInterval(() => tick(true), 50);
+        }, sprintDelay);
+    });
+
+    function startPolling() {
+        if (!isRunning || stopFlag) return;
+        setStatus('抢购运行中', 'running');
+        stageEl.textContent = '多 PID 轮询与结账中';
+        countdownBox.classList.remove('sprint');
+        logMsg('到达目标时间，开始轮询商品库存', 'ok');
         loopConfigAndBuy();
     }
 
-    // ============================================
-    // 抢单核心主流程
-    // ============================================
+    // --------------------------------------------
+    // 抢单核心流程
+    // --------------------------------------------
     async function loopConfigAndBuy() {
-        let attemptCount = 1;
-
-        // 支持通过逗号、空格或竖线分割多个 PID
-        const pidList = targetPid.split(/[,，| ]+/).map(p => p.trim()).filter(p => p);
+        let attempt = 1;
+        const pidList = targetPid.split(/[,，|\s]+/).map((p) => p.trim()).filter(Boolean);
         const stopMs = stopTime ? new Date(stopTime.replace(/-/g, '/')).getTime() : 0;
 
         while (isRunning && !stopFlag) {
-            // ⏰ 超过结束时间则自动停止
             if (stopMs > 0 && serverNow() >= stopMs) {
-                logMsg(`⏰ 已到设定的停止时间 ${stopTime}，自动结束！`, "#F44336");
-                isRunning = false;
-                stopFlag = true;
-                releaseWakeLock();
-                startBtn.style.display = 'block';
-                stopBtn.style.display = 'none';
-                ['tm-pid','tm-time','tm-stoptime','tm-pay','tm-speed'].forEach(id => {
-                    document.getElementById(id).disabled = false;
-                });
+                logMsg(`已达停止时间 ${stopTime}，自动结束`, 'warn');
+                stageEl.textContent = '已超时自动停止';
+                finishTask('已超时停止', 'idle');
                 return;
             }
 
             try {
-                let successGrab = false;
+                let grabbed = false;
 
-                // 遍历用户输入的每一个可选 PID
-                for (let currentPid of pidList) {
+                for (const currentPid of pidList) {
                     if (!isRunning || stopFlag) break;
 
-                    const t0 = Date.now(); // 计时开始
+                    const t0 = Date.now();
+                    await fetch('/cart?action=emptycart', { method: 'GET', credentials: 'include' }).catch(() => {});
 
-                    // ★★★ V3.8 修复：每个 PID 尝试前清空购物车，防止残留商品污染 ★★★
-                    await fetch('/cart?action=emptycart', { method: 'GET', credentials: 'include' }).catch(() => { });
+                    const configUrl = `/cart?action=configureproduct&pid=${encodeURIComponent(currentPid)}`;
+                    logMsg(`[#${attempt}] 探测 PID ${currentPid}`, 'sync');
 
-                    const configUrl = `/cart?action=configureproduct&pid=${currentPid}`;
-                    logMsg(`[#${attemptCount}] 探测商品 [PID: ${currentPid}]...`, "#0ff");
-
-                    // GET 请求探测是否有货
-                    const resp = await fetch(configUrl + "&nocache=" + Date.now(), { redirect: 'follow', credentials: 'include' });
-                    const text = await resp.text();
+                    const resp = await fetch(`${configUrl}&nocache=${Date.now()}`, {
+                        redirect: 'follow',
+                        credentials: 'include',
+                    });
+                    const html = await resp.text();
                     const t1 = Date.now();
-                    logMsg(`   └─ GET 响应: ${resp.status} | ${text.length} 字节 | 耗时 ${t1 - t0}ms`, "#888");
 
-                    if (text.includes('未到时间') || text.includes('缺货') || text.includes('Out of Stock')) {
-                        logMsg(`🚫 [PID: ${currentPid}] 缺货或未开放，秒切下个...`, "#FF9800");
-                        continue; // 此 PID 没货，立刻去探测下一个 PID
-                    }
-
-                    logMsg(`✅ [PID: ${currentPid}] 捕获有货！解析表单中...`, "#0ff");
-
-                    const parser = new DOMParser();
-                    const doc = parser.parseFromString(text, 'text/html');
-
-                    const form = doc.getElementById('frmConfigureProduct') || doc.querySelector('form');
-                    if (!form) {
-                        logMsg(`⚠️ [PID: ${currentPid}] HTML未找到表单结构，跳过... (HTML前200字: ${text.slice(0, 200)})`, "#FF9800");
+                    if (html.includes('未到时间') || html.includes('缺货') || html.includes('Out of Stock')) {
+                        logMsg(`PID ${currentPid} 暂无库存 (${resp.status} · ${t1 - t0}ms)`, 'warn');
                         continue;
                     }
-                    logMsg(`   └─ 表单ID: ${form.id || '无ID'} | action: ${form.action || '无'}`, "#888");
 
-                    // 收集所有表单字段
-                    let fields = {};
-
-                    form.querySelectorAll('input').forEach(input => {
-                        if (input.name) {
-                            if (input.type === 'radio' || input.type === 'checkbox') {
-                                if (input.checked) fields[input.name] = input.value;
-                            } else {
-                                fields[input.name] = input.value;
-                            }
-                        }
-                    });
-
-                    form.querySelectorAll('select').forEach(sel => {
-                        if (sel.name) {
-                            // DOMParser 不执行 JS，所以优先取 selected option，否则取第一个 option
-                            const selectedOpt = sel.querySelector('option[selected]') || sel.querySelector('option');
-                            fields[sel.name] = selectedOpt ? selectedOpt.value : sel.value;
-                        }
-                    });
-
-                    // ★★★ 核心修复：强制锁定正确的当前循环 PID 和数量 ★★★
-                    fields['pid'] = currentPid;
-                    fields['qty'] = '1';
-
-                    if ('host' in fields && !fields['host']) fields['host'] = 'vps-drop-sync-' + Date.now();
-                    if ('password' in fields && !fields['password']) fields['password'] = 'GenPass123!@';
-
-                    const fieldKeys = Object.keys(fields);
-                    logMsg(`   └─ 解析到 ${fieldKeys.length} 个字段: ${fieldKeys.join(', ')}`, "#888");
-                    console.log("[VPS Drop Sync Debug] Final Fields for PID " + currentPid + ":", fields);
-                    logMsg(`🚀 发包中: POST 加购 [PID: ${currentPid}]...`, "#0f0");
-
-                    // 第一步：POST 加购
-                    const formData = new URLSearchParams();
-                    for (const [k, v] of Object.entries(fields)) {
-                        formData.append(k, v);
+                    const doc = new DOMParser().parseFromString(html, 'text/html');
+                    const form = doc.getElementById('frmConfigureProduct') || doc.querySelector('form');
+                    if (!form) {
+                        logMsg(`PID ${currentPid} 页面未检测到配置表单，跳过`, 'warn');
+                        continue;
                     }
+
+                    const fields = {};
+                    form.querySelectorAll('input').forEach((input) => {
+                        if (!input.name) return;
+                        if (input.type === 'radio' || input.type === 'checkbox') {
+                            if (input.checked) fields[input.name] = input.value;
+                        } else {
+                            fields[input.name] = input.value;
+                        }
+                    });
+                    form.querySelectorAll('select').forEach((sel) => {
+                        if (!sel.name) return;
+                        const opt = sel.querySelector('option[selected]') || sel.querySelector('option');
+                        fields[sel.name] = opt ? opt.value : sel.value;
+                    });
+
+                    fields.pid = currentPid;
+                    fields.qty = '1';
+                    if ('host' in fields && !fields.host) fields.host = `vps-${Date.now()}`;
+                    if ('password' in fields && !fields.password) fields.password = generateFallbackPassword();
+
+                    logMsg(`PID ${currentPid} 有货，提交加购 (${Object.keys(fields).length} 字段)`, 'ok');
+                    const formData = new URLSearchParams();
+                    for (const [k, v] of Object.entries(fields)) formData.append(k, v);
 
                     const req1 = await fetch(configUrl, {
                         method: 'POST',
                         body: formData,
                         headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
                         redirect: 'follow',
-                        credentials: 'include'
+                        credentials: 'include',
                     });
                     const t2 = Date.now();
-                    if (!req1.ok) throw new Error(`加购 POST 报错 ${req1.status} (耗时${t2-t1}ms)`);
-                    logMsg(`🛒 加购完成 ${req1.status} | 跳转: ${req1.url.replace(location.origin,'').slice(0,60)} | 耗时 ${t2-t1}ms`, "#0f0");
-                    logMsg(`   └─ 0ms 延迟发起结账请求...`, "#888");
+                    if (!req1.ok) throw new Error(`加购请求异常 ${req1.status}`);
+                    logMsg(`加购成功 (${req1.status} · ${t2 - t1}ms)，发起结账`, 'ok');
 
-                    // 第二步：POST 结账（复用页面正常流程所需字段）
                     const checkoutData = new URLSearchParams();
-                    checkoutData.append("register_or_login", "register");
-                    checkoutData.append("notes", "");
-                    checkoutData.append("payment", paymentMethod);
-                    checkoutData.append("terms", "1"); // 强制同意协议
-                    checkoutData.append("promo", "");
-                    checkoutData.append("riskToken", "");
+                    checkoutData.append('register_or_login', 'register');
+                    checkoutData.append('notes', '');
+                    checkoutData.append('payment', paymentMethod);
+                    checkoutData.append('terms', '1');
+                    checkoutData.append('promo', '');
+                    checkoutData.append('riskToken', '');
 
                     const req2 = await fetch('/cart?action=viewcart&statuscart=checkout', {
                         method: 'POST',
                         body: checkoutData,
                         headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
                         redirect: 'follow',
-                        credentials: 'include'
+                        credentials: 'include',
                     });
                     const t3 = Date.now();
-                    if (!req2.ok) throw new Error(`结账 POST 报错 ${req2.status} (耗时${t3-t2}ms)`);
-                    logMsg(`💳 结账响应 ${req2.status} | 跳转: ${req2.url.replace(location.origin,'').slice(0,60)} | 耗时 ${t3-t2}ms`, "#0f0");
-                    logMsg(`   └─ 本轮总耗时: ${t3-t0}ms`, "#888");
+                    if (!req2.ok) throw new Error(`结账请求异常 ${req2.status}`);
 
-                    // ★★★ V3.5 终极修复：验证结账是否被服务器真正认可 ★★★
                     const finalUrl = req2.url.toLowerCase();
-                    // V3.8: 收紧白名单，只认 viewinvoice/viewbilling 账单页
-                    const isRealInvoice = finalUrl.includes('viewinvoice') || finalUrl.includes('viewbilling') || finalUrl.includes('invoice');
+                    const isRealInvoice =
+                        finalUrl.includes('viewinvoice') ||
+                        finalUrl.includes('viewbilling') ||
+                        finalUrl.includes('invoice');
+
                     if (!isRealInvoice) {
-                        // V3.9: 解析服务器返回的 HTML，提取真实的驳回原因
                         const body2 = await req2.text().catch(() => '');
                         const doc2 = new DOMParser().parseFromString(body2, 'text/html');
-                        // WHMCS 错误信息通常在 .errorbox / .alert-danger / #statusmessage 里
                         const errEl = doc2.querySelector('.errorbox, .alert-danger, #statusmessage, .alert');
-                        const errText = errEl ? errEl.innerText.trim().slice(0, 120) : '（无法提取原因）';
-                        const shortUrl = req2.url.replace(location.origin, '').slice(0, 80);
-                        logMsg(`🚫 [PID: ${currentPid}] 驳回 → 跳转: ${shortUrl}`, "#FF9800");
-                        logMsg(`   原因: ${errText}`, "#FF5722");
-                        console.warn("[VPS Drop Sync V4.1] Checkout rejected. Final URL:", req2.url);
-                        console.warn("[VPS Drop Sync V4.1] Error extract:", errText);
-                        console.warn("[VPS Drop Sync V4.1] Full response body:", body2.slice(0, 2000));
+                        const reason = errEl ? errEl.textContent.trim().slice(0, 100) : '未返回账单页';
+                        logMsg(`PID ${currentPid} 结账被拒：${reason}`, 'warn');
                         continue;
                     }
 
-                    logMsg(`🎉 真的抢到了 [PID: ${currentPid}]！跳转账单页...`, "#ffeb3b");
-                    releaseWakeLock(); // 抢到了，不用再防休眠
-
-                    // V3.8: 用非阻塞的通知替代 alert，避免浪费时间
-                    const successBanner = document.createElement('div');
-                    successBanner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999999;background:#4CAF50;color:#fff;text-align:center;padding:20px;font-size:20px;font-weight:bold;animation:flash 0.5s infinite alternate;';
-                    const flashStyle = document.createElement('style');
-                    flashStyle.textContent = '@keyframes flash{from{opacity:1}to{opacity:0.5}}';
-                    document.head.appendChild(flashStyle);
-                    successBanner.innerHTML = `🎉 VPS Drop Sync 已抢到 [PID: ${currentPid}]！正在跳转支付页…`;
-                    document.body.appendChild(successBanner);
-
-                    // 结束脚本并直达刚生成的账单页
+                    logMsg(`PID ${currentPid} 锁单成功（总耗时 ${t3 - t0}ms），跳转账单页`, 'ok');
+                    stageEl.textContent = `PID ${currentPid} 已生成账单`;
+                    finishTask('已锁单', 'running');
                     window.location.href = req2.url;
-                    successGrab = true;
-                    return; // 彻底结束
+                    grabbed = true;
+                    return;
                 }
 
-                // 如果这一回合把所有的 PID 都查了一遍都没成功，才进入外层的等待
-                if (!successGrab && isRunning && !stopFlag) {
-                    logMsg(`⏸ 所有的备选商品均被驳回或无货，${speedMs}ms后重试全体循环...`, "#FF9800");
+                if (!grabbed && isRunning && !stopFlag) {
+                    logMsg(`第 ${attempt} 轮未命中，${speedMs}ms 后重试`, 'info');
                 }
-
-            } catch (e) {
-                console.error(e);
-                logMsg(`⚠️ 报错: ${e.message}`, "#f00");
-                logMsg(`   └─ ${speedMs}ms 后重试下一轮...`, "#888");
+            } catch (err) {
+                logMsg(`请求异常：${err.message}，${speedMs}ms 后重试`, 'err');
             }
 
             if (isRunning && !stopFlag) {
-                await new Promise(r => setTimeout(r, speedMs));
-                attemptCount++;
+                await new Promise((r) => setTimeout(r, speedMs));
+                attempt++;
             }
         }
     }
-
 })();
