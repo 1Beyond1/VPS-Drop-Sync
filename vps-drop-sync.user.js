@@ -29,11 +29,14 @@
     const MAX_LOGS = 100;
     const PRE_SYNC_LEAD_MS = 60000;
     const SPRINT_LEAD_MS = 5200;
+    const SYNC_TIMEOUT_MS = 4000;
+    const REQUEST_TIMEOUT_MS = 8000;
+    const MAX_TIMEOUT_MS = 2147483647;
     const PRESET_PAYMENT_METHODS = ['AliPayH5', 'wechatpay', 'paypal'];
     const CUSTOM_PAYMENT_OPTION = '__custom__';
     const VALID_SPEEDS = [500, 100, 10];
     const LEGACY_KEYS = ['targetPid', 'startTime', 'stopTime', 'paymentMethod', 'speedMs'];
-    const MISSING_SENTINEL = Symbol('missing');
+    const MISSING_SENTINEL = '__VDS_MISSING_SENTINEL__';
 
     // --------------------------------------------
     // 核心纯逻辑（同时导出给 Node 单元测试复用）
@@ -268,8 +271,17 @@
     };
 
     const isInvoiceUrl = (url) => {
-        const lower = String(url || '').toLowerCase();
-        return lower.includes('viewinvoice') || lower.includes('viewbilling') || lower.includes('invoice');
+        const rawUrl = String(url || '').trim();
+        if (!rawUrl) return false;
+        let pathname = '';
+        try {
+            const parsed = new URL(rawUrl, 'https://placeholder.local');
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+            pathname = parsed.pathname.toLowerCase();
+        } catch {
+            return false;
+        }
+        return /\/(viewinvoice|viewbilling|invoices?)([._/-]|$)/.test(pathname);
     };
 
     const isLoginRedirect = (url, html = '') => {
@@ -291,7 +303,7 @@
         if (/\/(login|dologin|signin)(\.php)?(\/|$)/.test(pathname) || /[?&]action=login(&|$)/.test(search)) {
             return true;
         }
-        if (isInvoiceUrl(pathname + search) || /[?&]action=(configureproduct|viewcart)(&|$)/.test(search)) {
+        if (/[?&]action=(configureproduct|viewcart)(&|$)/.test(search)) {
             return false;
         }
         const text = String(html || '');
@@ -302,6 +314,87 @@
         );
     };
 
+    const classifyCheckoutResponse = (url, html = '') => {
+        if (isLoginRedirect(url, html)) return 'login';
+        if (isInvoiceUrl(url)) return 'invoice';
+        return 'rejected';
+    };
+
+    const findConfigureProductForm = (doc) => {
+        if (!doc) return null;
+        if (typeof doc.getElementById === 'function') {
+            const byId = doc.getElementById('frmConfigureProduct');
+            if (byId) return byId;
+        }
+        const forms =
+            typeof doc.querySelectorAll === 'function' ? Array.from(doc.querySelectorAll('form') || []) : [];
+        for (const form of forms) {
+            if (!form) continue;
+            const id = String(form.id || form.getAttribute?.('id') || '').toLowerCase();
+            if (id === 'frmconfigureproduct') return form;
+
+            const className = String(form.className || form.getAttribute?.('class') || '').toLowerCase();
+            const role = String(form.getAttribute?.('role') || '').toLowerCase();
+            const action = String(form.getAttribute?.('action') ?? form.action ?? '').toLowerCase();
+            const method = String(form.getAttribute?.('method') ?? form.method ?? '').toLowerCase();
+
+            if (role === 'search' || /\b(search|login|signin|newsletter)\b/.test(`${id} ${className}`)) {
+                continue;
+            }
+            if (/\/(search|login|dologin|signin)(\.php)?(\/|\?|$)/.test(action)) {
+                continue;
+            }
+
+            const controls =
+                typeof form.querySelectorAll === 'function'
+                    ? Array.from(form.querySelectorAll('input, select, textarea') || [])
+                    : [];
+            const hasConfigField = controls.some((el) => {
+                const name = String(el?.name || el?.getAttribute?.('name') || '').toLowerCase();
+                return (
+                    name === 'billingcycle' ||
+                    name === 'pid' ||
+                    name === 'productid' ||
+                    name === 'cycle' ||
+                    name.startsWith('configoption') ||
+                    name.startsWith('customfield') ||
+                    name.startsWith('addons') ||
+                    name.startsWith('addon[')
+                );
+            });
+
+            const hasConfigAction =
+                /[?&]action=(configureproduct|add)(&|$)/i.test(action) ||
+                /configureproduct/i.test(action);
+
+            if (hasConfigField || (hasConfigAction && method === 'post')) {
+                return form;
+            }
+        }
+        return null;
+    };
+
+    const appendFormField = (fields, name, value) => {
+        if (!(name in fields)) {
+            fields[name] = value;
+        } else if (Array.isArray(fields[name])) {
+            fields[name].push(value);
+        } else {
+            fields[name] = [fields[name], value];
+        }
+    };
+
+    const isOptionDisabled = (opt) =>
+        Boolean(
+            opt &&
+                (opt.disabled ||
+                    (typeof opt.hasAttribute === 'function' && opt.hasAttribute('disabled')) ||
+                    opt.parentElement?.disabled)
+        );
+
+    const isOptionSelected = (opt) =>
+        Boolean(opt && (opt.selected || (typeof opt.hasAttribute === 'function' && opt.hasAttribute('selected'))));
+
     const extractFormFields = (form, currentPid, { nowMs = Date.now(), fallbackPassword = () => 'VdsFallback#2026' } = {}) => {
         if (!form || typeof form.querySelectorAll !== 'function') return null;
         const fields = {};
@@ -309,24 +402,65 @@
         for (const input of form.querySelectorAll('input') || []) {
             if (!input.name || input.disabled) continue;
             const type = String(input.type || 'text').toLowerCase();
-            if (type === 'radio' || type === 'checkbox') {
+            if (type === 'radio') {
                 if (input.checked) fields[input.name] = input.value ?? '';
-            } else if (type !== 'file' && type !== 'reset' && type !== 'button') {
-                fields[input.name] = input.value ?? '';
+            } else if (type === 'checkbox') {
+                if (input.checked) appendFormField(fields, input.name, input.value ?? '');
+            } else if (
+                type !== 'file' &&
+                type !== 'reset' &&
+                type !== 'button' &&
+                type !== 'submit' &&
+                type !== 'image'
+            ) {
+                appendFormField(fields, input.name, input.value ?? '');
             }
         }
 
         for (const sel of form.querySelectorAll('select') || []) {
             if (!sel.name || sel.disabled) continue;
-            const opt =
-                (typeof sel.querySelector === 'function' && (sel.querySelector('option[selected]') || sel.querySelector('option'))) ||
-                null;
-            fields[sel.name] = opt ? (opt.value ?? '') : (sel.value ?? '');
+            const optionList =
+                typeof sel.querySelectorAll === 'function'
+                    ? Array.from(sel.querySelectorAll('option') || [])
+                    : Array.isArray(sel.options)
+                      ? Array.from(sel.options)
+                      : null;
+
+            if (optionList) {
+                const enabledOptions = optionList.filter((o) => o && !isOptionDisabled(o));
+                if (sel.multiple) {
+                    const selectedEnabled = enabledOptions.filter((o) => isOptionSelected(o));
+                    for (const o of selectedEnabled) {
+                        appendFormField(fields, sel.name, o.value ?? '');
+                    }
+                } else {
+                    const selectedOpt = enabledOptions.find((o) => isOptionSelected(o)) || enabledOptions[0] || null;
+                    if (selectedOpt) {
+                        appendFormField(fields, sel.name, selectedOpt.value ?? '');
+                    } else if (optionList.length === 0) {
+                        appendFormField(fields, sel.name, sel.value ?? '');
+                    }
+                }
+            } else if (typeof sel.querySelector === 'function') {
+                const selectedOpt =
+                    sel.querySelector('option[selected]:not([disabled])') || sel.querySelector('option[selected]');
+                const fallbackOpt = sel.querySelector('option:not([disabled])') || sel.querySelector('option');
+                const opt =
+                    (selectedOpt && !isOptionDisabled(selectedOpt) ? selectedOpt : null) ||
+                    (fallbackOpt && !isOptionDisabled(fallbackOpt) ? fallbackOpt : null);
+                if (opt) {
+                    appendFormField(fields, sel.name, opt.value ?? '');
+                } else if (!selectedOpt && !fallbackOpt) {
+                    appendFormField(fields, sel.name, sel.value ?? '');
+                }
+            } else {
+                appendFormField(fields, sel.name, sel.value ?? '');
+            }
         }
 
         for (const ta of form.querySelectorAll('textarea') || []) {
             if (!ta.name || ta.disabled) continue;
-            fields[ta.name] = ta.value ?? '';
+            appendFormField(fields, ta.name, ta.value ?? '');
         }
 
         fields.pid = String(currentPid);
@@ -334,6 +468,21 @@
         if ('host' in fields && !fields.host) fields.host = `vps-${nowMs}`;
         if ('password' in fields && !fields.password) fields.password = fallbackPassword();
         return fields;
+    };
+
+    const buildFormUrlSearchParams = (fields) => {
+        const formData = new URLSearchParams();
+        if (!fields || typeof fields !== 'object') return formData;
+        for (const [k, v] of Object.entries(fields)) {
+            if (Array.isArray(v)) {
+                for (const item of v) {
+                    formData.append(k, String(item ?? ''));
+                }
+            } else {
+                formData.append(k, String(v ?? ''));
+            }
+        }
+        return formData;
     };
 
     const buildCheckoutPayload = ({ paymentMethod, promoCode = '', notes = '' }) => {
@@ -345,6 +494,277 @@
         params.append('promo', String(promoCode || '').trim());
         params.append('riskToken', '');
         return params;
+    };
+
+    const getEnabledHostsFromStore = (store) => {
+        try {
+            const raw = store.get(ENABLED_HOSTS_KEY, '[]');
+            const hosts = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            return Array.isArray(hosts) ? hosts : [];
+        } catch {
+            return [];
+        }
+    };
+
+    const updateEnabledHosts = (store, host, enable) => {
+        const latestHosts = getEnabledHostsFromStore(store);
+        const nextHosts = enable
+            ? [...new Set([...latestHosts, host])]
+            : latestHosts.filter((item) => item !== host);
+        store.set(ENABLED_HOSTS_KEY, JSON.stringify(nextHosts));
+        return nextHosts;
+    };
+
+    const createAbortError = (message = 'The operation was aborted') => {
+        const err = new Error(message);
+        err.name = 'AbortError';
+        return err;
+    };
+
+    const createTimeoutError = (timeoutMs) => {
+        const err = new Error(`请求超时 (${timeoutMs}ms)`);
+        err.name = 'TimeoutError';
+        return err;
+    };
+
+    const fetchWithTimeout = async (
+        url,
+        options = {},
+        timeoutMs = REQUEST_TIMEOUT_MS,
+        signal = null,
+        fetchImpl = typeof fetch === 'function' ? fetch : null
+    ) => {
+        if (typeof fetchImpl !== 'function') {
+            throw new Error('fetch is not available');
+        }
+        const externalSignals = [];
+        if (signal) externalSignals.push(signal);
+        if (options && options.signal && options.signal !== signal) externalSignals.push(options.signal);
+
+        if (externalSignals.some((s) => s.aborted)) {
+            throw createAbortError();
+        }
+
+        const controller = typeof AbortController === 'function' ? new AbortController() : null;
+        let timedOut = false;
+        let externallyAborted = false;
+        let timeoutId = null;
+
+        const onExternalAbort = () => {
+            externallyAborted = true;
+            if (controller) {
+                try {
+                    controller.abort();
+                } catch {}
+            }
+        };
+
+        for (const s of externalSignals) {
+            s.addEventListener('abort', onExternalAbort, { once: true });
+        }
+
+        if (controller && Number.isFinite(timeoutMs) && timeoutMs > 0) {
+            timeoutId = setTimeout(() => {
+                timedOut = true;
+                try {
+                    controller.abort();
+                } catch {}
+            }, timeoutMs);
+        }
+
+        try {
+            const fetchOptions = { ...(options || {}) };
+            if (controller) fetchOptions.signal = controller.signal;
+            return await fetchImpl(url, fetchOptions);
+        } catch (err) {
+            if (timedOut) throw createTimeoutError(timeoutMs);
+            if (externallyAborted || externalSignals.some((s) => s.aborted)) {
+                throw createAbortError();
+            }
+            throw err;
+        } finally {
+            if (timeoutId !== null) clearTimeout(timeoutId);
+            for (const s of externalSignals) {
+                s.removeEventListener('abort', onExternalAbort);
+            }
+        }
+    };
+
+    const readTextWithTimeout = (resp, timeoutMs = REQUEST_TIMEOUT_MS, signal = null) => {
+        if (signal?.aborted) {
+            return Promise.reject(createAbortError());
+        }
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            let timeoutId = null;
+            const cleanup = () => {
+                if (timeoutId !== null) {
+                    clearTimeout(timeoutId);
+                    timeoutId = null;
+                }
+                if (signal) {
+                    signal.removeEventListener('abort', onAbort);
+                }
+            };
+            const finishResolve = (val) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                resolve(val);
+            };
+            const finishReject = (err) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                reject(err);
+            };
+            const onAbort = () => finishReject(createAbortError());
+
+            if (signal) {
+                signal.addEventListener('abort', onAbort, { once: true });
+            }
+            if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+                timeoutId = setTimeout(() => finishReject(createTimeoutError(timeoutMs)), timeoutMs);
+            }
+
+            Promise.resolve()
+                .then(() => resp.text())
+                .then(finishResolve, finishReject);
+        });
+    };
+
+    const abortableSleep = (ms, signal = null, { setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) =>
+        new Promise((resolve) => {
+            if (signal?.aborted) {
+                resolve(false);
+                return;
+            }
+            let done = false;
+            let timerId = null;
+            const finish = (completed) => {
+                if (done) return;
+                done = true;
+                if (timerId !== null) {
+                    clearTimeoutFn(timerId);
+                    timerId = null;
+                }
+                if (signal) {
+                    signal.removeEventListener('abort', onAbort);
+                }
+                resolve(completed);
+            };
+            const onAbort = () => finish(false);
+            timerId = setTimeoutFn(() => finish(true), Math.max(0, Number(ms) || 0));
+            if (signal) {
+                signal.addEventListener('abort', onAbort, { once: true });
+            }
+        });
+
+    const scheduleLongTimeout = (
+        callback,
+        delayMs,
+        { setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout, nowFn = Date.now, maxDelayMs = MAX_TIMEOUT_MS } = {}
+    ) => {
+        let cancelled = false;
+        let timerId = null;
+        const safeDelay = Math.max(0, Number.isFinite(delayMs) ? delayMs : 0);
+        const targetEndMs = nowFn() + safeDelay;
+
+        const step = () => {
+            if (cancelled) return;
+            const remaining = Math.max(0, targetEndMs - nowFn());
+            if (remaining <= maxDelayMs) {
+                timerId = setTimeoutFn(() => {
+                    timerId = null;
+                    if (!cancelled) callback();
+                }, remaining);
+            } else {
+                timerId = setTimeoutFn(() => {
+                    timerId = null;
+                    step();
+                }, maxDelayMs);
+            }
+        };
+
+        step();
+
+        return {
+            cancel() {
+                cancelled = true;
+                if (timerId !== null) {
+                    clearTimeoutFn(timerId);
+                    timerId = null;
+                }
+            },
+        };
+    };
+
+    const createRunController = () => {
+        let activeRunId = 0;
+        let activeAbortController = null;
+        let isRunning = false;
+        let stopFlag = false;
+        let isPolling = false;
+        let pollingRunId = 0;
+
+        const abortActive = () => {
+            if (activeAbortController) {
+                try {
+                    activeAbortController.abort();
+                } catch {}
+                activeAbortController = null;
+            }
+        };
+
+        return {
+            get activeRunId() {
+                return activeRunId;
+            },
+            get activeAbortController() {
+                return activeAbortController;
+            },
+            get signal() {
+                return activeAbortController ? activeAbortController.signal : null;
+            },
+            get isRunning() {
+                return isRunning;
+            },
+            get stopFlag() {
+                return stopFlag;
+            },
+            get isPolling() {
+                return isPolling;
+            },
+            startRun() {
+                abortActive();
+                activeRunId += 1;
+                activeAbortController = typeof AbortController === 'function' ? new AbortController() : null;
+                isRunning = true;
+                stopFlag = false;
+                isPolling = false;
+                pollingRunId = 0;
+                return { runId: activeRunId, signal: activeAbortController ? activeAbortController.signal : null };
+            },
+            stopRun() {
+                activeRunId += 1;
+                abortActive();
+                isRunning = false;
+                stopFlag = true;
+                isPolling = false;
+                pollingRunId = 0;
+                return activeRunId;
+            },
+            isActive(runId) {
+                return runId === activeRunId && isRunning && !stopFlag;
+            },
+            tryEnterPolling(runId) {
+                if (runId !== activeRunId || !isRunning || stopFlag) return false;
+                if (isPolling && pollingRunId === runId) return false;
+                isPolling = true;
+                pollingRunId = runId;
+                return true;
+            },
+        };
     };
 
     const clampPanelPosition = (pos, viewportWidth, viewportHeight, panelWidth, panelHeight, margin = 8) => {
@@ -359,12 +779,16 @@
 
     const core = {
         VERSION,
+        ENABLED_HOSTS_KEY,
         HOST_CONFIG_PREFIX,
         PRESET_PAYMENT_METHODS,
         CUSTOM_PAYMENT_OPTION,
         VALID_SPEEDS,
         PRE_SYNC_LEAD_MS,
         SPRINT_LEAD_MS,
+        SYNC_TIMEOUT_MS,
+        REQUEST_TIMEOUT_MS,
+        MAX_TIMEOUT_MS,
         MISSING_SENTINEL,
         formatLocalDateTime,
         parseLocalDateTime,
@@ -386,8 +810,18 @@
         isOutOfStockHtml,
         isInvoiceUrl,
         isLoginRedirect,
+        classifyCheckoutResponse,
+        findConfigureProductForm,
         extractFormFields,
+        buildFormUrlSearchParams,
         buildCheckoutPayload,
+        getEnabledHostsFromStore,
+        updateEnabledHosts,
+        fetchWithTimeout,
+        readTextWithTimeout,
+        abortableSleep,
+        scheduleLongTimeout,
+        createRunController,
         clampPanelPosition,
     };
 
@@ -452,17 +886,11 @@
     // 站点域名白名单（按 location.host 隔离）
     // --------------------------------------------
     function getEnabledHosts() {
-        try {
-            const hosts = JSON.parse(gmStore.get(ENABLED_HOSTS_KEY, '[]'));
-            return Array.isArray(hosts) ? hosts : [];
-        } catch {
-            return [];
-        }
+        return getEnabledHostsFromStore(gmStore);
     }
 
     const currentHost = location.host;
-    const enabledHosts = getEnabledHosts();
-    const isCurrentHostEnabled = enabledHosts.includes(currentHost);
+    const isCurrentHostEnabled = getEnabledHosts().includes(currentHost);
 
     if (typeof GM_registerMenuCommand === 'function') {
         GM_registerMenuCommand(
@@ -470,9 +898,10 @@
                 ? `在当前网站禁用 VPS Drop Sync（${currentHost}）`
                 : `在当前网站启用 VPS Drop Sync（${currentHost}）`,
             () => {
+                const latestHosts = getEnabledHosts();
                 const nextHosts = isCurrentHostEnabled
-                    ? enabledHosts.filter((host) => host !== currentHost)
-                    : [...new Set([...enabledHosts, currentHost])];
+                    ? latestHosts.filter((host) => host !== currentHost)
+                    : [...new Set([...latestHosts, currentHost])];
                 gmStore.set(ENABLED_HOSTS_KEY, JSON.stringify(nextHosts));
                 location.reload();
             }
@@ -1220,8 +1649,7 @@
     // --------------------------------------------
     // 状态、日志与 Wake Lock 管理
     // --------------------------------------------
-    let isRunning = false;
-    let stopFlag = false;
+    const runCtrl = createRunController();
     let timeChecker = null;
     let preSyncTimer = null;
     let precisionTimer = null;
@@ -1236,7 +1664,7 @@
 
     presetButtons.forEach((btn) => {
         btn.addEventListener('click', () => {
-            if (isRunning) return;
+            if (runCtrl.isRunning) return;
             const preset = btn.getAttribute('data-preset');
             const result = computeTimePreset(preset, {
                 nowMs: serverNow(),
@@ -1315,11 +1743,11 @@
             timeChecker = null;
         }
         if (preSyncTimer) {
-            clearTimeout(preSyncTimer);
+            preSyncTimer.cancel();
             preSyncTimer = null;
         }
         if (precisionTimer) {
-            clearTimeout(precisionTimer);
+            precisionTimer.cancel();
             precisionTimer = null;
         }
         if (redirectTimer) {
@@ -1344,47 +1772,77 @@
         stopBtn.style.display = disabled ? 'block' : 'none';
     }
 
-    async function acquireWakeLock() {
+    async function requestScreenWakeLock(runId) {
+        if (!('wakeLock' in navigator) || !runCtrl.isActive(runId)) return null;
+        const sentinel = await navigator.wakeLock.request('screen');
+        if (!runCtrl.isActive(runId)) {
+            if (sentinel && typeof sentinel.release === 'function') {
+                sentinel.release().catch(() => {});
+            }
+            return null;
+        }
+        if (wakeLock && wakeLock !== sentinel && typeof wakeLock.release === 'function') {
+            wakeLock.release().catch(() => {});
+        }
+        wakeLock = sentinel;
+        return sentinel;
+    }
+
+    async function acquireWakeLock(runId) {
         if (!('wakeLock' in navigator)) {
             logMsg('浏览器不支持 Wake Lock，请手动保持屏幕常亮', 'warn');
             return;
         }
         try {
-            wakeLock = await navigator.wakeLock.request('screen');
+            const sentinel = await requestScreenWakeLock(runId);
+            if (!sentinel) return;
             logMsg('防休眠锁已激活', 'ok');
             if (!window._vdsWakeLockBound) {
                 window._vdsWakeLockBound = true;
                 document.addEventListener('visibilitychange', async () => {
-                    if (document.visibilityState === 'visible' && isRunning && !stopFlag) {
-                        wakeLock = await navigator.wakeLock.request('screen').catch(() => null);
+                    if (document.visibilityState === 'visible' && runCtrl.isRunning && !runCtrl.stopFlag) {
+                        const currentRunId = runCtrl.activeRunId;
+                        await requestScreenWakeLock(currentRunId).catch(() => null);
                     }
                 });
             }
         } catch (err) {
-            logMsg(`防休眠申请失败：${err.message}`, 'warn');
+            if (runCtrl.isActive(runId)) {
+                logMsg(`防休眠申请失败：${err.message}`, 'warn');
+            }
         }
     }
 
     function releaseWakeLock() {
         if (!wakeLock) return;
-        wakeLock.release().catch(() => {});
+        const current = wakeLock;
         wakeLock = null;
+        if (typeof current.release === 'function') {
+            current.release().catch(() => {});
+        }
     }
 
     // --------------------------------------------
     // 二段式服务器时钟校准（RTT 去极值均值）
     // --------------------------------------------
-    async function syncServerTime(label = '校时', samples = 5) {
+    async function syncServerTime(label = '校时', samples = 5, { runId, signal = null, abortIfPolling = false } = {}) {
+        if (!runCtrl.isActive(runId) || (abortIfPolling && runCtrl.isPolling)) return null;
         setStatus('校时中', 'syncing');
         stageEl.textContent = `${label}（${samples} 次采样）`;
         logMsg(`${label}开始，采样 ${samples} 次`, 'sync');
 
         const pairs = [];
         for (let i = 0; i < samples; i++) {
-            if (stopFlag) return null;
+            if (!runCtrl.isActive(runId) || (abortIfPolling && runCtrl.isPolling)) return null;
             try {
                 const t0 = Date.now();
-                const resp = await fetch('/', { method: 'HEAD', credentials: 'include', cache: 'no-store' });
+                const resp = await fetchWithTimeout(
+                    '/',
+                    { method: 'HEAD', credentials: 'include', cache: 'no-store' },
+                    SYNC_TIMEOUT_MS,
+                    signal
+                );
+                if (!runCtrl.isActive(runId) || (abortIfPolling && runCtrl.isPolling)) return null;
                 const t1 = Date.now();
                 const dateHeader = resp.headers.get('Date');
                 if (dateHeader) {
@@ -1394,14 +1852,23 @@
                         pairs.push({ delta: serverMs - (t0 + t1) / 2, rtt });
                     }
                 }
-                if (i < samples - 1) await new Promise((r) => setTimeout(r, 200));
-            } catch {
-                // 单次采样失败继续后续样本
+                if (i < samples - 1) {
+                    await abortableSleep(200, signal);
+                    if (!runCtrl.isActive(runId) || (abortIfPolling && runCtrl.isPolling)) return null;
+                }
+            } catch (err) {
+                if (!runCtrl.isActive(runId) || (abortIfPolling && runCtrl.isPolling) || err?.name === 'AbortError') {
+                    return null;
+                }
+                // 单次采样失败（含超时）继续后续样本
             }
         }
 
+        if (!runCtrl.isActive(runId) || (abortIfPolling && runCtrl.isPolling)) return null;
+
         const result = computeClockCalibration(pairs);
         if (!result) {
+            serverTimeDelta = 0;
             deltaEl.textContent = '本地时钟';
             rttEl.textContent = '--';
             logMsg(`${label}采样失败，回退本地时钟`, 'warn');
@@ -1424,8 +1891,7 @@
     // --------------------------------------------
     function finishTask(statusText, tone = 'idle') {
         clearAllTimers();
-        isRunning = false;
-        stopFlag = true;
+        runCtrl.stopRun();
         releaseWakeLock();
         setControlsDisabled(false);
         countdownBox.classList.remove('sprint');
@@ -1492,21 +1958,20 @@
         });
 
         clearAllTimers();
+        const { runId, signal } = runCtrl.startRun();
         setControlsDisabled(true);
-        isRunning = true;
-        stopFlag = false;
 
-        acquireWakeLock();
+        acquireWakeLock(runId);
         if (stopMs > 0) logMsg(`已设自动停止：${stopTime}`, 'info');
         if (promoCode) logMsg(`结账将自动附带优惠码：${promoCode}`, 'info');
 
-        await syncServerTime('启动初校', 3);
-        if (!isRunning || stopFlag) return;
+        await syncServerTime('启动初校', 3, { runId, signal });
+        if (!runCtrl.isActive(runId)) return;
 
         let lastLogAt = 0;
 
         const enterSprintInterval = (tickFn) => {
-            if (!isRunning || stopFlag || inSprintMode) return;
+            if (!runCtrl.isActive(runId) || runCtrl.isPolling || inSprintMode) return;
             inSprintMode = true;
             if (timeChecker) clearInterval(timeChecker);
             timeChecker = setInterval(() => tickFn(true), 50);
@@ -1514,11 +1979,11 @@
         };
 
         const tick = (sprint) => {
+            if (!runCtrl.isActive(runId) || runCtrl.isPolling) return;
             const now = serverNow();
             if (now >= targetMs) {
-                clearAllTimers();
                 countdownEl.textContent = '00:00:00.0';
-                startPolling();
+                startPolling(runId);
                 return;
             }
             const remainMs = targetMs - now;
@@ -1542,8 +2007,9 @@
         };
 
         const schedulePrecisionSprint = (reason) => {
+            if (!runCtrl.isActive(runId) || runCtrl.isPolling) return null;
             if (precisionTimer) {
-                clearTimeout(precisionTimer);
+                precisionTimer.cancel();
                 precisionTimer = null;
             }
             const plan = computeSchedulePlan({
@@ -1553,9 +2019,8 @@
             });
 
             if (plan.shouldStartPolling) {
-                clearAllTimers();
                 countdownEl.textContent = '00:00:00.0';
-                startPolling();
+                startPolling(runId);
                 return plan;
             }
 
@@ -1564,7 +2029,7 @@
                 return plan;
             }
 
-            precisionTimer = setTimeout(() => {
+            precisionTimer = scheduleLongTimeout(() => {
                 enterSprintInterval(tick);
             }, plan.sprintDelayMs);
 
@@ -1579,18 +2044,23 @@
         };
 
         const initialPlan = schedulePrecisionSprint('initial');
-        if (!isRunning || stopFlag || initialPlan.shouldStartPolling) return;
+        if (!runCtrl.isActive(runId) || runCtrl.isPolling || !initialPlan || initialPlan.shouldStartPolling) return;
 
         setStatus('定时待命', 'armed');
         if (initialPlan.shouldPreSync && initialPlan.preSyncDelayMs !== null) {
             stageEl.textContent = '开抢前 60 秒自动精校';
             logMsg('已预约开抢前 60 秒二次精校', 'info');
-            preSyncTimer = setTimeout(async () => {
-                if (!isRunning || stopFlag) return;
-                await syncServerTime('开抢前精校', 5);
-                if (!isRunning || stopFlag) return;
+            preSyncTimer = scheduleLongTimeout(async () => {
+                if (!runCtrl.isActive(runId) || runCtrl.isPolling) return;
+                await syncServerTime('开抢前精校', 5, { runId, signal, abortIfPolling: true });
+                if (!runCtrl.isActive(runId) || runCtrl.isPolling) return;
                 const recalibratedPlan = schedulePrecisionSprint('recalibrated');
-                if (isRunning && !stopFlag && !recalibratedPlan.shouldStartPolling) {
+                if (
+                    runCtrl.isActive(runId) &&
+                    !runCtrl.isPolling &&
+                    recalibratedPlan &&
+                    !recalibratedPlan.shouldStartPolling
+                ) {
                     setStatus('即将开抢', 'armed');
                     if (!recalibratedPlan.shouldSprintImmediately) {
                         stageEl.textContent = '二次精校已完成 · 定时已重算';
@@ -1601,34 +2071,36 @@
             stageEl.textContent = '倒计时同步运行中';
         }
 
-        if (!inSprintMode) {
+        if (!inSprintMode && runCtrl.isActive(runId) && !runCtrl.isPolling) {
             tick(false);
-            if (isRunning && !stopFlag && !inSprintMode) {
+            if (runCtrl.isActive(runId) && !runCtrl.isPolling && !inSprintMode) {
                 timeChecker = setInterval(() => tick(false), 200);
             }
         }
     });
 
-    function startPolling() {
-        if (!isRunning || stopFlag) return;
+    function startPolling(runId) {
+        if (!runCtrl.tryEnterPolling(runId)) return;
+        clearAllTimers();
         setStatus('抢购运行中', 'running');
         stageEl.textContent = '多 PID 轮询与结账中';
         countdownBox.classList.remove('sprint');
         logMsg('到达目标时间，开始轮询商品库存', 'ok');
-        loopConfigAndBuy();
+        loopConfigAndBuy(runId, runCtrl.signal);
     }
 
     // --------------------------------------------
     // 抢单核心流程
     // --------------------------------------------
-    async function loopConfigAndBuy() {
+    async function loopConfigAndBuy(runId, signal) {
         let attempt = 1;
         const pidList = parsePidList(hostConfig.targetPid);
         const stopMs = hostConfig.stopTime ? parseLocalDateTime(hostConfig.stopTime) : 0;
 
         try {
-            while (isRunning && !stopFlag) {
+            while (runCtrl.isActive(runId)) {
                 if (stopMs > 0 && serverNow() >= stopMs) {
+                    if (!runCtrl.isActive(runId)) return;
                     const msg = `已达停止时间 ${hostConfig.stopTime}，自动结束`;
                     logMsg(msg, 'warn');
                     stageEl.textContent = '已超时自动停止';
@@ -1641,19 +2113,33 @@
                     let grabbed = false;
 
                     for (const currentPid of pidList) {
-                        if (!isRunning || stopFlag) break;
+                        if (!runCtrl.isActive(runId)) return;
 
                         const t0 = Date.now();
-                        await fetch('/cart?action=emptycart', { method: 'GET', credentials: 'include' }).catch(() => {});
+                        await fetchWithTimeout(
+                            '/cart?action=emptycart',
+                            { method: 'GET', credentials: 'include' },
+                            REQUEST_TIMEOUT_MS,
+                            signal
+                        ).catch(() => {});
+                        if (!runCtrl.isActive(runId)) return;
 
                         const configUrl = `/cart?action=configureproduct&pid=${encodeURIComponent(currentPid)}`;
                         logMsg(`[#${attempt}] 探测 PID ${currentPid}`, 'sync');
 
-                        const resp = await fetch(`${configUrl}&nocache=${Date.now()}`, {
-                            redirect: 'follow',
-                            credentials: 'include',
-                        });
-                        const html = await resp.text();
+                        const resp = await fetchWithTimeout(
+                            `${configUrl}&nocache=${Date.now()}`,
+                            {
+                                redirect: 'follow',
+                                credentials: 'include',
+                            },
+                            REQUEST_TIMEOUT_MS,
+                            signal
+                        );
+                        if (!runCtrl.isActive(runId)) return;
+
+                        const html = await readTextWithTimeout(resp, REQUEST_TIMEOUT_MS, signal);
+                        if (!runCtrl.isActive(runId)) return;
                         const t1 = Date.now();
 
                         if (isLoginRedirect(resp.url, html)) {
@@ -1665,13 +2151,18 @@
                             return;
                         }
 
+                        if (!resp.ok) {
+                            logMsg(`PID ${currentPid} 探测返回异常状态 (${resp.status} · ${t1 - t0}ms)，跳过`, 'warn');
+                            continue;
+                        }
+
                         if (isOutOfStockHtml(html)) {
                             logMsg(`PID ${currentPid} 暂无库存 (${resp.status} · ${t1 - t0}ms)`, 'warn');
                             continue;
                         }
 
                         const doc = new DOMParser().parseFromString(html, 'text/html');
-                        const form = doc.getElementById('frmConfigureProduct') || doc.querySelector('form');
+                        const form = findConfigureProductForm(doc);
                         if (!form) {
                             logMsg(`PID ${currentPid} 页面未检测到配置表单，跳过`, 'warn');
                             continue;
@@ -1681,19 +2172,40 @@
                             nowMs: Date.now(),
                             fallbackPassword: generateFallbackPassword,
                         });
+                        if (!fields) {
+                            logMsg(`PID ${currentPid} 配置表单解析失败，跳过`, 'warn');
+                            continue;
+                        }
 
-                        logMsg(`PID ${currentPid} 有货，提交加购 (${Object.keys(fields).length} 字段)`, 'ok');
-                        const formData = new URLSearchParams();
-                        for (const [k, v] of Object.entries(fields)) formData.append(k, v);
+                        const fieldCount = Object.values(fields).reduce(
+                            (count, val) => count + (Array.isArray(val) ? val.length : 1),
+                            0
+                        );
+                        logMsg(`PID ${currentPid} 有货，提交加购 (${fieldCount} 字段)`, 'ok');
+                        const formData = buildFormUrlSearchParams(fields);
 
-                        const req1 = await fetch(configUrl, {
-                            method: 'POST',
-                            body: formData,
-                            headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
-                            redirect: 'follow',
-                            credentials: 'include',
-                        });
+                        const req1 = await fetchWithTimeout(
+                            configUrl,
+                            {
+                                method: 'POST',
+                                body: formData,
+                                headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+                                redirect: 'follow',
+                                credentials: 'include',
+                            },
+                            REQUEST_TIMEOUT_MS,
+                            signal
+                        );
+                        if (!runCtrl.isActive(runId)) return;
                         const t2 = Date.now();
+                        if (isLoginRedirect(req1.url)) {
+                            const msg = '加购阶段跳转登录页，登录状态已失效，任务自动停止';
+                            logMsg(msg, 'err');
+                            stageEl.textContent = '登录状态失效';
+                            finishTask('异常停止', 'error');
+                            triggerAlert('error', `VPS Drop Sync · 登录失效 (${currentHost})`, msg);
+                            return;
+                        }
                         if (!req1.ok) throw new Error(`加购请求异常 ${req1.status}`);
                         logMsg(`加购成功 (${req1.status} · ${t2 - t1}ms)，发起结账`, 'ok');
 
@@ -1702,26 +2214,44 @@
                             promoCode: hostConfig.promoCode,
                         });
 
-                        const req2 = await fetch('/cart?action=viewcart&statuscart=checkout', {
-                            method: 'POST',
-                            body: checkoutData,
-                            headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
-                            redirect: 'follow',
-                            credentials: 'include',
-                        });
+                        const req2 = await fetchWithTimeout(
+                            '/cart?action=viewcart&statuscart=checkout',
+                            {
+                                method: 'POST',
+                                body: checkoutData,
+                                headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+                                redirect: 'follow',
+                                credentials: 'include',
+                            },
+                            REQUEST_TIMEOUT_MS,
+                            signal
+                        );
+                        if (!runCtrl.isActive(runId)) return;
                         const t3 = Date.now();
+                        if (isLoginRedirect(req2.url)) {
+                            const msg = '结账阶段跳转登录页，登录状态已失效，任务自动停止';
+                            logMsg(msg, 'err');
+                            stageEl.textContent = '登录状态失效';
+                            finishTask('异常停止', 'error');
+                            triggerAlert('error', `VPS Drop Sync · 登录失效 (${currentHost})`, msg);
+                            return;
+                        }
                         if (!req2.ok) throw new Error(`结账请求异常 ${req2.status}`);
 
-                        if (!isInvoiceUrl(req2.url)) {
-                            const body2 = await req2.text().catch(() => '');
-                            if (isLoginRedirect(req2.url, body2)) {
-                                const msg = '结账阶段跳转登录页，登录状态已失效，任务自动停止';
-                                logMsg(msg, 'err');
-                                stageEl.textContent = '登录状态失效';
-                                finishTask('异常停止', 'error');
-                                triggerAlert('error', `VPS Drop Sync · 登录失效 (${currentHost})`, msg);
-                                return;
-                            }
+                        const body2 = await readTextWithTimeout(req2, REQUEST_TIMEOUT_MS, signal).catch(() => '');
+                        if (!runCtrl.isActive(runId)) return;
+
+                        const checkoutOutcome = classifyCheckoutResponse(req2.url, body2);
+                        if (checkoutOutcome === 'login') {
+                            const msg = '结账阶段跳转登录页，登录状态已失效，任务自动停止';
+                            logMsg(msg, 'err');
+                            stageEl.textContent = '登录状态失效';
+                            finishTask('异常停止', 'error');
+                            triggerAlert('error', `VPS Drop Sync · 登录失效 (${currentHost})`, msg);
+                            return;
+                        }
+
+                        if (checkoutOutcome !== 'invoice') {
                             const doc2 = new DOMParser().parseFromString(body2, 'text/html');
                             const errEl = doc2.querySelector('.errorbox, .alert-danger, #statusmessage, .alert');
                             const reason = errEl ? errEl.textContent.trim().slice(0, 100) : '未返回账单页';
@@ -1746,19 +2276,21 @@
                         return;
                     }
 
-                    if (!grabbed && isRunning && !stopFlag) {
+                    if (!grabbed && runCtrl.isActive(runId)) {
                         logMsg(`第 ${attempt} 轮未命中，${hostConfig.speedMs}ms 后重试`, 'info');
                     }
                 } catch (err) {
+                    if (!runCtrl.isActive(runId) || err?.name === 'AbortError') return;
                     logMsg(`请求异常：${err.message}，${hostConfig.speedMs}ms 后重试`, 'err');
                 }
 
-                if (isRunning && !stopFlag) {
-                    await new Promise((r) => setTimeout(r, hostConfig.speedMs));
-                    attempt++;
-                }
+                if (!runCtrl.isActive(runId)) return;
+                await abortableSleep(hostConfig.speedMs, signal);
+                if (!runCtrl.isActive(runId)) return;
+                attempt++;
             }
         } catch (fatalErr) {
+            if (!runCtrl.isActive(runId) || fatalErr?.name === 'AbortError') return;
             const msg = `抢购任务因未预期异常中断：${fatalErr?.message || fatalErr}`;
             logMsg(msg, 'err');
             stageEl.textContent = '异常停止';
