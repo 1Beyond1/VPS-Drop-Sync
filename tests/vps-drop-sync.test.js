@@ -471,11 +471,33 @@ test('P1-2: fetchWithTimeout, readTextWithTimeout, and abortableSleep enforce ti
     }));
     assert.equal(await core.readTextWithTimeout(okResp, 1000), 'hello');
 
-    // 5. readTextWithTimeout rejects when body hangs
+    // 5. readTextWithTimeout rejects and cancels body stream when body hangs or aborts
+    let bodyCancelledOnTimeout = 0;
     await assert.rejects(
-        core.readTextWithTimeout({ text: () => new Promise(() => {}) }, 25),
+        core.readTextWithTimeout(
+            {
+                body: { cancel: () => { bodyCancelledOnTimeout++; } },
+                text: () => new Promise(() => {}),
+            },
+            25
+        ),
         (err) => err.name === 'TimeoutError'
     );
+    assert.equal(bodyCancelledOnTimeout, 1);
+
+    let bodyCancelledOnAbort = 0;
+    const bodyAc = new AbortController();
+    const pendingBody = core.readTextWithTimeout(
+        {
+            body: { cancel: () => { bodyCancelledOnAbort++; } },
+            text: () => new Promise(() => {}),
+        },
+        5000,
+        bodyAc.signal
+    );
+    bodyAc.abort();
+    await assert.rejects(pendingBody, (err) => err.name === 'AbortError');
+    assert.equal(bodyCancelledOnAbort, 1);
 
     // 6. abortableSleep resolves false immediately on abort, true on completion
     const sleepAc = new AbortController();
@@ -632,6 +654,24 @@ test('P2: findConfigureProductForm ignores search/login forms and extractFormFie
     assert.equal(params.get('region'), 'hk');
     assert.equal(params.has('submit_btn'), false);
     assert.equal(params.has('img_btn'), false);
+
+    // Prototype-colliding field names (toString / constructor) must not collide with Object.prototype
+    const protoForm = {
+        querySelectorAll(selector) {
+            if (selector === 'input') {
+                return [
+                    { name: 'toString', type: 'text', value: 'v1' },
+                    { name: 'constructor', type: 'hidden', value: 'v2' },
+                ];
+            }
+            return [];
+        },
+    };
+    const protoFields = core.extractFormFields(protoForm, '4001');
+    assert.equal(protoFields.toString, 'v1');
+    assert.equal(protoFields.constructor, 'v2');
+    assert.equal(core.buildFormUrlSearchParams(protoFields).get('toString'), 'v1');
+    assert.equal(core.buildFormUrlSearchParams(protoFields).get('constructor'), 'v2');
 });
 
 test('P2: string MISSING_SENTINEL is structuredClone-safe, scheduleLongTimeout chunks > 32-bit delays, and updateEnabledHosts preserves concurrent tabs', () => {

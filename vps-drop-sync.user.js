@@ -374,8 +374,10 @@
         return null;
     };
 
+    const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+
     const appendFormField = (fields, name, value) => {
-        if (!(name in fields)) {
+        if (!hasOwn(fields, name)) {
             fields[name] = value;
         } else if (Array.isArray(fields[name])) {
             fields[name].push(value);
@@ -465,8 +467,8 @@
 
         fields.pid = String(currentPid);
         fields.qty = '1';
-        if ('host' in fields && !fields.host) fields.host = `vps-${nowMs}`;
-        if ('password' in fields && !fields.password) fields.password = fallbackPassword();
+        if (hasOwn(fields, 'host') && !fields.host) fields.host = `vps-${nowMs}`;
+        if (hasOwn(fields, 'password') && !fields.password) fields.password = fallbackPassword();
         return fields;
     };
 
@@ -590,8 +592,19 @@
         }
     };
 
+    const cancelResponseBody = (resp) => {
+        try {
+            if (resp && resp.body && typeof resp.body.cancel === 'function') {
+                Promise.resolve(resp.body.cancel()).catch(() => {});
+            }
+        } catch {
+            // 忽略已锁或已关闭流取消异常
+        }
+    };
+
     const readTextWithTimeout = (resp, timeoutMs = REQUEST_TIMEOUT_MS, signal = null) => {
         if (signal?.aborted) {
+            cancelResponseBody(resp);
             return Promise.reject(createAbortError());
         }
         return new Promise((resolve, reject) => {
@@ -618,13 +631,19 @@
                 cleanup();
                 reject(err);
             };
-            const onAbort = () => finishReject(createAbortError());
+            const onAbort = () => {
+                cancelResponseBody(resp);
+                finishReject(createAbortError());
+            };
 
             if (signal) {
                 signal.addEventListener('abort', onAbort, { once: true });
             }
             if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
-                timeoutId = setTimeout(() => finishReject(createTimeoutError(timeoutMs)), timeoutMs);
+                timeoutId = setTimeout(() => {
+                    cancelResponseBody(resp);
+                    finishReject(createTimeoutError(timeoutMs));
+                }, timeoutMs);
             }
 
             Promise.resolve()
