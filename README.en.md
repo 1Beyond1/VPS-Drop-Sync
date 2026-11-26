@@ -1,5 +1,9 @@
 [简体中文](README.md) | English
 
+<p align="center">
+  <img src="docs/assets/logo.png" alt="VPS Drop Sync Logo" width="84" />
+</p>
+
 # VPS Drop Sync
 
 A generic Tampermonkey userscript for time-synchronized VPS restock monitoring and automatic checkout.

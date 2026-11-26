@@ -1,5 +1,9 @@
 简体中文 | [English](README.en.md)
 
+<p align="center">
+  <img src="docs/assets/logo.png" alt="VPS Drop Sync Logo" width="84" />
+</p>
+
 # VPS Drop Sync
 
 通用 VPS 放货精准对时与自动抢购助手。
